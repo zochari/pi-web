@@ -3,6 +3,38 @@ import { existsSync } from "fs";
 import { allowFileRoot } from "@/lib/file-access";
 import { invalidateSessionListCache } from "@/lib/session-reader";
 import { startRpcSession } from "@/lib/rpc-manager";
+import { createAgentSessionServices, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { scopeAvailableModels } from "@/lib/model-scope";
+
+/**
+ * Resolve the default model for a new session, scoped to the user's enabledModels
+ * + enabledProviders whitelists (mirrors GET /api/models). Returns the settings default
+ * if available in the scoped set, else the first scoped model. Used when the client
+ * creates a session without specifying a model, so the SDK's findInitialModel doesn't
+ * fall through to an arbitrary openrouter model (openrouter/moonshotai/kimi-k2.6) and
+ * ignore the user's settings defaultModel + enabledModels + enabledProviders.
+ */
+async function resolveScopedDefaultModel(cwd: string): Promise<{ provider: string; modelId: string } | null> {
+  try {
+    const agentDir = getAgentDir();
+    const services = await createAgentSessionServices({ cwd, agentDir });
+    const settings = services.settingsManager;
+    const available = await services.modelRuntime.getAvailable();
+    const scoped = scopeAvailableModels(available, settings);
+    const dp = settings.getDefaultProvider();
+    const dm = settings.getDefaultModel();
+    if (dp && dm && scoped.some((m) => m.provider === dp && m.id === dm)) {
+      return { provider: dp, modelId: dm };
+    }
+    if (scoped.length > 0) {
+      return { provider: scoped[0].provider, modelId: scoped[0].id };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 // POST /api/agent/new  body: { cwd: string; type: string; message?: string; ... }
 // Spawns a brand-new pi session. Most calls immediately send the first command;
 // type:"ensure_session" only creates the runtime so clients can query commands.
@@ -31,9 +63,17 @@ export async function POST(req: Request) {
     allowFileRoot(cwd);
     invalidateSessionListCache();
 
-    // Apply pre-selected model before sending the prompt
+    // Apply pre-selected model before sending the prompt. If the client sent no model
+    // (e.g. the /api/models fetch hadn't resolved yet), fall back to the scoped default
+    // — otherwise the SDK's findInitialModel picks an arbitrary openrouter model
+    // (openrouter/moonshotai/kimi-k2.6), ignoring settings defaultModel + enabledModels.
     if (provider && modelId) {
       await session.send({ type: "set_model", provider, modelId });
+    } else {
+      const fallback = await resolveScopedDefaultModel(cwd);
+      if (fallback) {
+        await session.send({ type: "set_model", provider: fallback.provider, modelId: fallback.modelId });
+      }
     }
 
     // Apply pre-selected thinking level before sending the prompt
