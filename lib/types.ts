@@ -1,4 +1,7 @@
 // Types mirrored from pi-mono coding-agent session-manager
+// [ask-user-question-bridge] see lib/ask-user-question-bridge/protocol.ts; remove this import + the
+// two union members below (ask_user_question in each type) to fully disable.
+import type { AskUserQuestionPromptPayload, AskUserQuestionResult } from "./ask-user-question-bridge/protocol";
 
 export interface SessionHeader {
   type: "session";
@@ -186,12 +189,21 @@ export type ExtensionUiRequest =
       method: "custom";
       lines: string[];
       closed?: boolean;
+    }
+  // ask_user_question extension support
+  | {
+      type: "extension_ui_request";
+      id: string;
+      method: "ask_user_question";
+      payload: AskUserQuestionPromptPayload;
     };
 
 export type ExtensionUiResponse =
   | { type: "extension_ui_response"; id: string; value: string }
   | { type: "extension_ui_response"; id: string; confirmed: boolean }
-  | { type: "extension_ui_response"; id: string; cancelled: true };
+  | { type: "extension_ui_response"; id: string; cancelled: true }
+  // [ask-user-question-bridge]
+  | { type: "extension_ui_response"; id: string; method: "ask_user_question"; result: AskUserQuestionResult };
 
 export interface ExtensionStatusItem {
   key: string;

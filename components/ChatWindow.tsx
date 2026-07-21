@@ -20,6 +20,8 @@ import {
   restoreScrollTop,
   VISIBLE_PAGE_SIZE,
 } from "@/lib/chat-lazy-load";
+// [ask-user-question-bridge]
+import { AskUserQuestionDialog } from "./ask-user-question-bridge/AskUserQuestionDialog";
 
 interface Props {
   session: SessionInfo | null;
@@ -172,6 +174,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
     isCompacting, compactError, compactResult, displayModel: displayModelValue, sessionStats,
     slashCommands, slashCommandsLoading, queuedMessages,
     notices, extensionDialog, extensionCustomUi, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput,
+    askUserQuestionRequest, respondToAskUserQuestion,
     isAutoModelSelection,
     agentPhase,
     isNew,
@@ -398,6 +401,14 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
         <ExtensionCustomPanel
           request={extensionCustomUi}
           onInput={sendExtensionCustomInput}
+        />
+      )}
+
+      {/* ask_user_question bridge */}
+      {askUserQuestionRequest && (
+        <AskUserQuestionDialog
+          request={askUserQuestionRequest}
+          onRespond={respondToAskUserQuestion}
         />
       )}
 

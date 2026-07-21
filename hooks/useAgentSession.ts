@@ -9,6 +9,8 @@ import type {
   SessionInfo,
   SessionTreeNode,
 } from "@/lib/types";
+// [ask-user-question-bridge]
+import type { AskUserQuestionResult } from "@/lib/ask-user-question-bridge/protocol";
 import { normalizeToolCalls } from "@/lib/normalize";
 import { sendAgentCommand } from "@/lib/agent-client";
 import { getToolNamesForPreset, type ToolEntry } from "@/lib/tool-presets";
@@ -77,6 +79,10 @@ type AgentStateResponse = {
   extensionStatuses?: ExtensionStatusItem[];
   extensionWidgets?: ExtensionWidgetItem[];
   queuedMessages?: { steering?: string[]; followUp?: string[] } | null;
+  // Pending UI requests the agent is blocked on, surfaced via get_state so a page
+  // refresh can re-show the dialog. Dispatched through the same handleExtensionUiRequest
+  // used for live extension_ui_request events.
+  pendingUiRequests?: ExtensionUiRequest[];
 };
 
 export interface QueuedMessages {
@@ -90,6 +96,8 @@ function normalizeQueuedMessages(q?: { steering?: string[]; followUp?: string[] 
 
 type ExtensionUiDialogRequest = Extract<ExtensionUiRequest, { method: "select" | "confirm" | "input" | "editor" }>;
 type ExtensionUiCustomRequest = Extract<ExtensionUiRequest, { method: "custom" }>;
+// ask_user_question bridge
+export type AskUserQuestionUiRequest = Extract<ExtensionUiRequest, { method: "ask_user_question" }>;
 export type NoticeType = "info" | "success" | "warning" | "error";
 
 export type NoticeItem = {
@@ -362,6 +370,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [sessionStatsOverride, setSessionStatsOverride] = useState<SessionStatsInfo | null>(null);
   const [extensionDialog, setExtensionDialog] = useState<ExtensionUiDialogRequest | null>(null);
   const [extensionCustomUi, setExtensionCustomUi] = useState<ExtensionUiCustomRequest | null>(null);
+  const [askUserQuestionRequest, setAskUserQuestionRequest] = useState<AskUserQuestionUiRequest | null>(null);
   const [extensionStatuses, setExtensionStatuses] = useState<ExtensionStatusItem[]>([]);
   const [extensionWidgets, setExtensionWidgets] = useState<ExtensionWidgetItem[]>([]);
   const [queuedMessages, setQueuedMessages] = useState<QueuedMessages>({ steering: [], followUp: [] });
@@ -678,6 +687,26 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, []);
 
+  // ask_user_question bridge
+  const respondToAskUserQuestion = useCallback(async (
+    request: AskUserQuestionUiRequest,
+    result: AskUserQuestionResult,
+  ) => {
+    const sid = sessionIdRef.current;
+    setAskUserQuestionRequest((current) => current?.id === request.id ? null : current);
+    if (!sid) return;
+    try {
+      await sendAgentCommand(sid, {
+        type: "extension_ui_response",
+        id: request.id,
+        method: "ask_user_question",
+        result,
+      });
+    } catch (e) {
+      console.error("Failed to send ask_user_question response:", e);
+    }
+  }, []);
+
   const addNotice = useCallback((notice: { id?: string; message: string; type?: NoticeType }) => {
     const message = notice.message.trim();
     if (!message) return;
@@ -698,6 +727,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       case "input":
       case "editor":
         setExtensionDialog(request);
+        break;
+      case "ask_user_question": // [ask-user-question-bridge]
+        setAskUserQuestionRequest(request);
         break;
       case "notify": {
         addNotice({
@@ -1516,6 +1548,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           if (agentState.state.extensionStatuses !== undefined) setExtensionStatuses(agentState.state.extensionStatuses ?? []);
           if (agentState.state.extensionWidgets !== undefined) setExtensionWidgets(agentState.state.extensionWidgets ?? []);
           if (agentState.state.queuedMessages !== undefined) setQueuedMessages(normalizeQueuedMessages(agentState.state.queuedMessages));
+          // Re-surface UI requests the agent is still blocked on (ask_user_question /
+          // select / confirm / input / editor) so a page refresh re-shows the dialog
+          // bound to the original id — answering it still resolves the agent's pending
+          // call. Same handler as live extension_ui_request events.
+          if (agentState.state.pendingUiRequests) {
+            for (const request of agentState.state.pendingUiRequests) handleExtensionUiRequest(request);
+          }
         }
       });
     }
@@ -1624,6 +1663,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     isCompacting, compactError, compactResult, currentModel, displayModel, sessionStats,
     slashCommands, slashCommandsLoading, queuedMessages,
     notices: noticeState.visible, extensionDialog, extensionCustomUi, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput,
+    askUserQuestionRequest, respondToAskUserQuestion,
     isAutoModelSelection: isNew && newSessionModel === null,
     agentPhase,
     isNew,
