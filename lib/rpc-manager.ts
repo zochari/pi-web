@@ -5,7 +5,8 @@ import { existsSync, writeFileSync } from "fs";
 import { invalidateModelsCache } from "./models-cache";
 import { cacheSessionPath, invalidateSessionListCache } from "./session-reader";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
-import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./pi-types";
+import type { AgentSessionLike, ExtensionUiContextLike, ModelLike, ToolInfo } from "./pi-types";
+import { scopeAvailableModels } from "./model-scope";
 import type { ExtensionUiRequest, ExtensionUiResponse, ExtensionWidgetItem } from "./types";
 import { createHeadlessCustomUiTui, DEFAULT_CUSTOM_UI_COLUMNS } from "./custom-ui-terminal";
 // [ask-user-question-bridge] see lib/ask-user-question-bridge/ for full context; remove this import to fully disable.
@@ -1073,6 +1074,92 @@ export function notifyRunningChange(): void {
 }
 
 /**
+ * Reconcile the in-memory model after `createAgentSession` reloads an existing session.
+ *
+ * `startRpcSession` calls `createAgentSession` without an explicit `model`, so the SDK runs
+ * `findInitialModel`. That calls `modelRegistry.find(settingsDefault)` BEFORE the registry is
+ * fully populated, the find returns undefined, and `findInitialModel` falls back to an arbitrary
+ * built-in model — `openrouter/moonshotai/kimi-k2.6` — ignoring the user's `defaultModel` +
+ * `enabledModels` + `enabledProviders`. `/api/agent/new` corrects this for brand-new sessions
+ * with an explicit `set_model`, but that route is NOT used when an idle `AgentSessionWrapper`
+ * (10-min idle timeout) is destroyed and the next request reloads the session from disk here.
+ * Without reconciliation the reloaded session silently runs on kimi-k2.6 even though the
+ * session file (and the UI selector, which reads the file) still show the user's chosen model.
+ *
+ * Restore the model the session was actually using (the last `model_change` in the file) when it
+ * is still registered; otherwise fall back to the scoped default (mirroring GET /api/models and
+ * /api/agent/new). Set `agent.state.model` directly rather than calling `setModel` — `setModel`
+ * would append a redundant `model_change` and persist the model as the global `defaultModel` in
+ * settings.json on every reload, which an automatic fix must not do.
+ */
+async function reconcileReloadedModel(
+  inner: AgentSessionLike,
+  sessionManager: SessionManager,
+): Promise<void> {
+  try {
+    const ctx = sessionManager.buildSessionContext();
+    const recorded = ctx.model as { provider: string; modelId: string } | undefined;
+    const current = inner.model;
+
+    let desired: { provider: string; modelId: string } | null = null;
+    if (recorded) {
+      if (current && current.provider === recorded.provider && current.id === recorded.modelId) return;
+      if (inner.modelRuntime.getModel(recorded.provider, recorded.modelId)) {
+        desired = { provider: recorded.provider, modelId: recorded.modelId };
+      }
+    }
+    if (!desired) desired = await resolveScopedDefaultModelFromInner(inner);
+    if (!desired) return;
+    if (current && current.provider === desired.provider && current.id === desired.modelId) return;
+
+    const model = inner.modelRuntime.getModel(desired.provider, desired.modelId);
+    if (!model) return;
+
+    const state = inner.agent.state as unknown as
+      | { model: ModelLike; thinkingLevel: string }
+      | undefined;
+    if (!state) return;
+    state.model = model;
+    // Deliberately NOT re-clamping state.thinkingLevel for the corrected model. Re-clamping
+    // would route through setThinkingLevel, which writes defaultThinkingLevel to settings.json
+    // (and appends a thinking_level_change) on any real change — a silent global-settings
+    // mutation on every reload, which an automatic fix must not do. The provider clamps the
+    // level to the corrected model's supported set at request time (per the SDK's own
+    // getAvailableThinkingLevels comment), so leaving the SDK's value matches its restore
+    // behavior and avoids the side effect. In the scoped-default fallback (recorded model no
+    // longer registered) the file still records the old model while the session runs on the
+    // scoped default — strictly better than kimi, and the user's next explicit model pick
+    // appends the correcting model_change.
+  } catch {
+    // Best-effort: never break session creation over a model fix.
+  }
+}
+
+/**
+ * Resolve the scoped default model from a live session's own services — the fallback when a
+ * reloaded session's recorded model is no longer registered. Mirrors the scoped-default logic
+ * in GET /api/models and app/api/agent/new/route.ts (settings default if in the scoped set,
+ * else the first scoped model).
+ */
+async function resolveScopedDefaultModelFromInner(
+  inner: AgentSessionLike,
+): Promise<{ provider: string; modelId: string } | null> {
+  try {
+    const available = await inner.modelRuntime.getAvailable();
+    const scoped = scopeAvailableModels(available, inner.settingsManager);
+    const dp = inner.settingsManager.getDefaultProvider();
+    const dm = inner.settingsManager.getDefaultModel();
+    if (dp && dm && scoped.some((m) => m.provider === dp && m.id === dm)) {
+      return { provider: dp, modelId: dm };
+    }
+    if (scoped.length > 0) return { provider: scoped[0].provider, modelId: scoped[0].id };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Get or create an AgentSession for the given session.
  * For new sessions (sessionFile === ""), pi generates its own id.
  * Pass toolNames to pre-configure active tools (empty array = all tools disabled).
@@ -1143,6 +1230,13 @@ export async function startRpcSession(
     // keep this forced after extension resource discovery and reloads as well.
     if (toolNames?.length === 0) {
       wrapper.setForceEmptySystemPrompt(true);
+    }
+
+    // Reloaded sessions: reconcile the in-memory model the SDK's findInitialModel picked wrongly
+    // (kimi-k2.6). Brand-new sessions (sessionFile === "") are corrected by /api/agent/new's
+    // explicit set_model, so this is reload-only — see reconcileReloadedModel for the full why.
+    if (sessionFile) {
+      await reconcileReloadedModel(inner, sessionManager);
     }
     wrapper.start();
 

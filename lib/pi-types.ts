@@ -121,7 +121,7 @@ export interface AgentSessionLike {
   readonly autoCompactionEnabled: boolean;
   readonly autoRetryEnabled: boolean;
   readonly model: ModelLike | undefined;
-  readonly modelRuntime: { getModel: (provider: string, modelId: string) => ModelLike | undefined };
+  readonly modelRuntime: { getModel: (provider: string, modelId: string) => ModelLike | undefined; getAvailable: () => Promise<readonly ModelLike[]> };
   readonly sessionManager: SessionManager;
   readonly settingsManager: SettingsManager;
   readonly agent: { state?: { systemPrompt?: string; thinkingLevel?: string } };

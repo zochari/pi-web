@@ -147,6 +147,15 @@ Tool names are passed at session creation (`POST /api/agent/new` → `toolNames[
 ### Model defaults for new sessions
 `GET /api/models` returns `defaultModel` read from `~/.pi/agent/settings.json`. `ChatWindow` pre-selects this on mount for new sessions.
 
+### Reloaded sessions silently revert to kimi-k2.6 — reconciled in `startRpcSession`
+`startRpcSession` calls `createAgentSession` **without a `model`**, so the SDK runs `findInitialModel`. Inside `createAgentSession` the model registry isn't fully populated yet, so `find(defaultProvider, defaultModel)` returns `undefined` and `findInitialModel` falls to its step-4 fallback — `openrouter/moonshotai/kimi-k2.6` — ignoring `defaultModel`/`enabledModels`/`enabledProviders`. `/api/agent/new` corrects this for brand-new sessions with an explicit `set_model`, but that route is **not** used when an idle `AgentSessionWrapper` is destroyed (10-min timeout) and the next request reloads the session from disk via `startRpcSession`.
+
+The trap: `createAgentSession` does **not** append a `model_change` on reload, so the session file (and the UI selector, which reads `data.context.model` from the file) still shows the user's chosen model — but `inner.model` is kimi, so the **next prompt silently runs on kimi** while the selector looks right.
+
+**Fix**: `reconcileReloadedModel(inner, sessionManager)` runs on the **reload path only** (`sessionFile` non-empty). It reads the model recorded in the file (last `model_change`) and sets `inner.agent.state.model` **directly** — *not* `inner.setModel()`, which would append a redundant `model_change` and persist it as the global `defaultModel` in `settings.json` on every reload (a silent global mutation). Falls back to the scoped default (`resolveScopedDefaultModelFromInner`, mirroring `GET /api/models`) if the recorded model is no longer registered. Deliberately does **not** re-clamp `thinkingLevel` — the provider clamps at request time, and re-clamping would write `defaultThinkingLevel` to `settings.json` on divergence.
+
+**Don't regress this** (fixed three times): the new-session route fix alone is insufficient — the reload path in `startRpcSession` must reconcile. And because `globalThis.__piSessions` survives hot-reload, a code change to `rpc-manager.ts` applies to new/reload paths only; live wrappers keep their in-memory model until they idle out or you `pm2 restart pi-web`.
+
 ### SSE reconnect on page refresh mid-stream
 On `ChatWindow` mount, `GET /api/agent/[id]` is called. If `state.isStreaming === true`, SSE is reconnected automatically. `thinkingLevel` and `isCompacting` are also synced from this response.
 
