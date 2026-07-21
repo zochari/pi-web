@@ -589,6 +589,10 @@ function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCal
     const tc = block as ToolCallContent;
     const result = toolResults?.get(tc.toolCallId);
     const duration = toolCallDurations?.get(tc.toolCallId);
+    if (tc.toolName === "todo") {
+      const details = parseTodoDetails(result);
+      if (details) return <TodoToolBlock block={tc} result={result} details={details} duration={duration} />;
+    }
     return <ToolCallBlock block={tc} result={result} duration={duration} />;
   }
   return null;
@@ -679,6 +683,147 @@ function ThinkingBlock({ block, duration, sessionId, entryId, blockIndex }: {
   );
 }
 
+
+type TodoStatus = "pending" | "in_progress" | "completed" | "deleted";
+
+interface TodoTask {
+  id: number;
+  subject: string;
+  activeForm?: string;
+  status: TodoStatus;
+  blockedBy?: number[];
+}
+
+interface TodoDetails {
+  action: "create" | "update" | "list" | "get" | "delete" | "clear";
+  params: Record<string, unknown>;
+  tasks: TodoTask[];
+  error?: string;
+}
+
+const TODO_STATUS_GLYPH: Record<TodoStatus, string> = { pending: "○", in_progress: "◐", completed: "✓", deleted: "✗" };
+const TODO_STATUS_COLOR: Record<TodoStatus, string> = { pending: "var(--text-dim)", in_progress: "#f59e0b", completed: "#16a34a", deleted: "var(--text-dim)" };
+
+function parseTodoDetails(result?: ToolResultMessage): TodoDetails | null {
+  const details = (result as unknown as { details?: unknown } | undefined)?.details;
+  if (!details || typeof details !== "object") return null;
+  const d = details as Record<string, unknown>;
+  if (!Array.isArray(d.tasks) || typeof d.action !== "string") return null;
+  return d as unknown as TodoDetails;
+}
+
+function formatTodoCallPreview(input: Record<string, unknown>): string {
+  const action = String(input.action ?? "");
+  const glyph = ({ create: "+", update: "→", delete: "×", get: "›", list: "☰", clear: "∅" } as Record<string, string>)[action] ?? action;
+  if (action === "create" && input.subject) return `${glyph} ${String(input.subject)}`;
+  if ((action === "update" || action === "get" || action === "delete") && input.id !== undefined) return `${glyph} #${input.id}`;
+  if (action === "list" && input.status) return `${glyph} ${String(input.status)}`;
+  return glyph;
+}
+
+function todoResultHeader(details: TodoDetails, rawText: string): string {
+  if (details.error) return `Error: ${details.error}`;
+  const visible = details.tasks.filter((t) => t.status !== "deleted");
+  if (details.action === "list") {
+    return visible.length === 0 ? "No tasks" : `${visible.length} task${visible.length === 1 ? "" : "s"}`;
+  }
+  if (details.action === "get") {
+    const id = details.params.id as number | undefined;
+    const t = details.tasks.find((x) => x.id === id);
+    return t ? `#${t.id}: ${t.subject}` : `#${id}`;
+  }
+  // create/update/delete/clear already produce a single precise line server-side.
+  return rawText.split("\n")[0] ?? "";
+}
+
+function TodoToolBlock({ block, result, details, duration }: { block: ToolCallContent; result?: ToolResultMessage; details: TodoDetails; duration?: number }) {
+  const [expanded, setExpanded] = useState(true);
+  const isError = !!details.error;
+  const rawText = result?.content.filter((b): b is { type: "text"; text: string } => b.type === "text").map((b) => b.text).join("\n") ?? "";
+  const headerText = result ? todoResultHeader(details, rawText) : formatTodoCallPreview(block.input);
+  const tasks = details.tasks.filter((t) => t.status !== "deleted");
+
+  return (
+    <div
+      style={{
+        borderRadius: 7,
+        overflow: "hidden",
+        fontSize: 12,
+        border: isError ? "1px solid rgba(248,113,113,0.45)" : "1px solid rgba(34,197,94,0.25)",
+        background: isError ? "rgba(248,113,113,0.05)" : "rgba(34,197,94,0.04)",
+      }}
+    >
+      <button
+        onClick={() => setExpanded((v) => !v)}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 7,
+          width: "100%",
+          padding: "6px 10px",
+          background: "none",
+          border: "none",
+          color: "var(--text-muted)",
+          cursor: "pointer",
+          fontSize: 12,
+          textAlign: "left",
+          minWidth: 0,
+        }}
+      >
+        <span style={{ color: isError ? "#f87171" : "#16a34a", fontFamily: "var(--font-mono)", fontWeight: 600, fontSize: 11, flexShrink: 0 }}>
+          Todo
+        </span>
+        <span style={{ color: "var(--text-dim)", fontFamily: "var(--font-mono)", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
+          {headerText}
+        </span>
+        {duration !== undefined && (
+          <span style={{ fontSize: 11, color: "var(--text-dim)", flexShrink: 0, fontVariantNumeric: "tabular-nums" }}>{duration}s</span>
+        )}
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="var(--text-dim)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, transform: expanded ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}>
+          <polyline points="2 3.5 5 6.5 8 3.5" />
+        </svg>
+      </button>
+
+      {expanded && (
+        <div
+          style={{
+            padding: "4px 10px 8px",
+            borderTop: isError ? "1px solid rgba(248,113,113,0.25)" : "1px solid rgba(34,197,94,0.2)",
+            background: "var(--bg-subtle)",
+          }}
+        >
+          {tasks.length === 0 ? (
+            <div style={{ color: "var(--text-dim)", fontStyle: "italic", fontSize: 12, padding: "4px 0" }}>No tasks</div>
+          ) : (
+            tasks.map((t) => (
+              <div key={t.id} style={{ display: "flex", alignItems: "baseline", gap: 6, fontSize: 12, padding: "2px 0" }}>
+                <span style={{ color: TODO_STATUS_COLOR[t.status], width: 12, flexShrink: 0 }}>{TODO_STATUS_GLYPH[t.status]}</span>
+                <span style={{ color: "var(--text-dim)", fontFamily: "var(--font-mono)", fontSize: 10, flexShrink: 0 }}>#{t.id}</span>
+                <span
+                  style={{
+                    color: t.status === "completed" ? "var(--text-dim)" : "var(--text-muted)",
+                    textDecoration: t.status === "completed" ? "line-through" : "none",
+                    flex: 1,
+                    minWidth: 0,
+                    wordBreak: "break-word",
+                  }}
+                >
+                  {t.subject}
+                </span>
+                {t.status === "in_progress" && t.activeForm && (
+                  <span style={{ color: "var(--text-dim)", fontSize: 11, fontStyle: "italic", flexShrink: 0 }}>({t.activeForm})</span>
+                )}
+                {t.blockedBy && t.blockedBy.length > 0 && (
+                  <span style={{ color: "var(--text-dim)", fontSize: 11, flexShrink: 0 }}>⛓ {t.blockedBy.map((id) => `#${id}`).join(",")}</span>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function ToolCallBlock({ block, result, duration }: { block: ToolCallContent; result?: ToolResultMessage; duration?: number }) {
   const [expanded, setExpanded] = useState(false);
