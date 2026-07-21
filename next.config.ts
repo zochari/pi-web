@@ -9,13 +9,21 @@ try {
   piVersion = (JSON.parse(readFileSync(piPkgPath, "utf8")) as { version: string }).version;
 } catch { /* package not found, use default */ }
 
+// Local-only dev origin overrides live in .dev-origins.json (gitignored) so
+// internal hostnames/subnets aren't committed. Falls back to LAN only.
+let extraDevOrigins: string[] = [];
+try {
+  const parsed = JSON.parse(readFileSync(join(__dirname, ".dev-origins.json"), "utf8"));
+  if (Array.isArray(parsed)) extraDevOrigins = parsed as string[];
+} catch { /* no local overrides */ }
+
 const nextConfig: NextConfig = {
   serverExternalPackages: [
     "@earendil-works/pi-coding-agent",
     "@earendil-works/pi-ai",
     "@earendil-works/pi-tui",
   ],
-  allowedDevOrigins: ['192.168.*.*'],
+  allowedDevOrigins: ['192.168.*.*', ...extraDevOrigins],
   async headers() {
     return [
       {

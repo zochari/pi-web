@@ -3,12 +3,24 @@
 ## Quick Start
 
 ```bash
+# Canonical: dev mode under pm2 (hot-reload via Turbopack Fast Refresh,
+# restart-on-crash, survives reboot). pm2 `watch` stays OFF — Next's own
+# Fast Refresh handles hot-reload; pm2 only restarts on crash.
+pm2 start npm --name pi-web --cwd <pi-web-dir> -- run dev
+pm2 save
+
+# Or ad-hoc, without pm2:
 npm run dev   # port 30141
 ```
 
 Typecheck: `node_modules/.bin/tsc --noEmit`  
 Lint: `npm run lint`  
-**Never run `next build` during dev** — pollutes `.next/` and breaks `npm run dev`.
+**Never run `next build` during dev** — pollutes `.next/` and breaks `npm run dev`. `next build` is only for the production path below.
+
+To revert to production later:
+```bash
+pm2 delete pi-web && npm run build && pm2 start npm --name pi-web --cwd <pi-web-dir> -- start && pm2 save
+```
 
 ---
 
