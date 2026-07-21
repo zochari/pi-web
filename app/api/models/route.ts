@@ -29,12 +29,11 @@ async function loadModels(cwd: string): Promise<ModelsData> {
   const services = await createAgentSessionServices({ cwd, agentDir });
   const available = await services.modelRuntime.getAvailable();
   const settings: SettingsManager = services.settingsManager;
-  // Scope the picker to the user's enabled models + enabled providers. This mirrors
+  // Scope the picker to the user's enabled models (matches the pi CLI). This mirrors
   // resolveScopedDefaultModel (app/api/agent/new/route.ts) and the reload-path
   // resolveScopedDefaultModelFromInner (lib/rpc-manager.ts) so the picker and the
   // new-session default stay in sync — diverging here reintroduces the class of
-  // bug the reloaded-model fix addresses. enabledModels matches the pi CLI;
-  // enabledProviders is the pi-web-specific provider whitelist.
+  // bug the reloaded-model fix addresses.
   const scoped = scopeAvailableModels(available, settings);
   modelList = scoped.map((m: { id: string; name: string; provider: string }) => ({
     id: m.id,

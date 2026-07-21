@@ -22,12 +22,11 @@ Patches are ordered oldest-first (the order they apply on top of upstream). Drop
 - Upstream: not upstream. Upstream has generic `createHeadlessCustomUiTui` rendering for `ctx.ui.custom()` (terminal), not a web bridge for `ask_user_question`.
 - Disable: `PIWEB_DISABLE_ASK_USER_QUESTION_BRIDGE=1` (the bridge stays inert; the SDK uses its own internal EventBus).
 
-## feat: scope visible models to enabledModels / enabledProviders
-- Purpose: filter the model list to the user's `enabledModels` + `enabledProviders` whitelists in `GET /api/models`, and resolve the default model for a new session within the scoped set (`resolveScopedDefaultModel`) so the SDK's `findInitialModel` doesn't fall through to `openrouter/moonshotai/kimi-k2.6` and ignore the user's `defaultModel`/`enabledModels`/`enabledProviders`.
+## feat: scope visible models to enabledModels
+- Purpose: filter the model list to the user's `enabledModels` in `GET /api/models`, and resolve the default model for a new session within the scoped set (`resolveScopedDefaultModel`) so the SDK's `findInitialModel` doesn't fall through to `openrouter/moonshotai/kimi-k2.6` and ignore the user's `defaultModel`/`enabledModels`. (The pi-web-specific `enabledProviders` provider whitelist was removed — it blocked providers like `opencode-go` when `enabledProviders` was set but the models were in `enabledModels`.)
 - Files: `lib/model-scope.ts`, `app/api/models/route.ts`, `app/api/agent/new/route.ts`.
 - Upstream: not upstream. Upstream has no model-scope filtering; `/api/models` returns the full registry and new sessions fall back to `findInitialModel`.
 - Dependency: `lib/model-scope.ts` is also used by the reloaded-model reconcile patch below.
-
 ## fix: reconcile reloaded-session model (avoid silent kimi-k2.6 revert)
 - Purpose: on the reload path (an idle session is destroyed, the next request reloads it from disk), `createAgentSession` runs `findInitialModel` before the registry is populated and falls back to `kimi-k2.6`, ignoring the user's model — the session file and UI selector still show the chosen model, so the next prompt silently runs on kimi while the selector looks right. `reconcileReloadedModel` reads the model from the last `model_change` and sets `inner.agent.state.model` directly (not `setModel`, which would append a `model_change` and persist it as the global `defaultModel` on every reload), falling back to the scoped default when the recorded model is no longer registered. Deliberately does not re-clamp `thinkingLevel` (the provider clamps at request time).
 - Files: `lib/rpc-manager.ts`, `lib/pi-types.ts` (adds `getAvailable` to `AgentSessionLike.modelRuntime`), `AGENTS.md`.
