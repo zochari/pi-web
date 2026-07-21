@@ -2,6 +2,7 @@ import { createAgentSessionFromServices, createAgentSessionServices, getAgentDir
 import { KeybindingsManager as TuiKeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, writeFileSync } from "fs";
+import { join } from "path";
 import { invalidateModelsCache } from "./models-cache";
 import { cacheSessionPath, invalidateSessionListCache } from "./session-reader";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
@@ -101,6 +102,47 @@ function withExtensionTools(session: AgentSessionLike, toolNames: string[]): str
     .filter((name) => !codingToolNames.has(name));
 
   return [...new Set([...toolNames, ...extensionToolNames])];
+}
+
+/**
+ * Ensure the pi-subagents extension spawns the real `pi` CLI as its child
+ * process, not this Next.js server. Without this, getPiInvocation
+ * (edxeth/pi-subagents) treats process.argv[1] (the Next.js server script)
+ * as the pi binary and re-launches Next.js with pi's flags, so every
+ * subagent fails fast with a non-zero exit. Setting PI_SUBAGENT_PI_COMMAND
+ * makes the extension's override branch win; the child env is spread from
+ * process.env, so nested pi children inherit it too. An explicit
+ * PI_SUBAGENT_PI_COMMAND in the environment always takes precedence.
+ */
+async function ensureSubagentPiCommand(): Promise<void> {
+  if (process.env.PI_SUBAGENT_PI_COMMAND) return;
+  const candidates = new Set<string>();
+  try {
+    const { getPackageDir } = (await import("@earendil-works/pi-coding-agent")) as {
+      getPackageDir?: () => string;
+    };
+    if (getPackageDir) candidates.add(join(getPackageDir(), "dist", "cli.js"));
+  } catch {
+    // SDK not importable (shouldn't happen -- it's a hard dependency).
+  }
+  candidates.add(
+    join(
+      process.cwd(),
+      "node_modules",
+      "@earendil-works",
+      "pi-coding-agent",
+      "dist",
+      "cli.js",
+    ),
+  );
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      process.env.PI_SUBAGENT_PI_COMMAND = `${process.execPath} ${candidate}`;
+      return;
+    }
+  }
+  // Last resort: rely on `pi` being on PATH.
+  process.env.PI_SUBAGENT_PI_COMMAND = "pi";
 }
 
 // ============================================================================
@@ -1170,6 +1212,7 @@ export async function startRpcSession(
   cwd: string,
   toolNames?: string[]
 ): Promise<{ session: AgentSessionWrapper; realSessionId: string }> {
+  if (!process.env.PI_SUBAGENT_PI_COMMAND) await ensureSubagentPiCommand();
   const registry = getRegistry();
   const locks = getLocks();
 
