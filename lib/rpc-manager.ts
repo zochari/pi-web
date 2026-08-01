@@ -1,13 +1,17 @@
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { createAgentSessionFromServices, createAgentSessionServices, getAgentDir, initTheme, SessionManager, Theme } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager as TuiKeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
-import { existsSync, writeFileSync } from "fs";
-import { join } from "path";
+import { existsSync, realpathSync, writeFileSync } from "fs";
+import { join, resolve } from "path";
+import { validateAgentImages } from "./image-attachments";
 import { invalidateModelsCache } from "./models-cache";
+import { resolveVisibleModels, selectInitialModelScope } from "./model-scope";
 import { cacheSessionPath, invalidateSessionListCache } from "./session-reader";
+import { getProjectTrustStatus, projectTrustReloadOptions } from "./project-trust";
+import { persistExplicitStartupPreferences } from "./startup-preferences";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
-import type { AgentSessionLike, ExtensionUiContextLike, ModelLike, ToolInfo } from "./pi-types";
-import { scopeAvailableModels } from "./model-scope";
+import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./pi-types";
 import type { ExtensionUiRequest, ExtensionUiResponse, ExtensionWidgetItem } from "./types";
 import { createHeadlessCustomUiTui, DEFAULT_CUSTOM_UI_COLUMNS } from "./custom-ui-terminal";
 // [ask-user-question-bridge] see lib/ask-user-question-bridge/ for full context; remove this import to fully disable.
@@ -61,6 +65,29 @@ type ExtensionCommandContextActionsLike = {
 type ExtensionBindingOptions = {
   forceEmptySystemPrompt?: boolean;
 };
+
+const RUNNING_STATE_EVENT_TYPES = new Set([
+  "agent_start",
+  "agent_end",
+  "agent_settled",
+  "auto_compaction_start",
+  "auto_compaction_end",
+  "compaction_start",
+  "compaction_end",
+]);
+
+const IDLE_RESET_EVENT_TYPES = new Set([
+  "agent_end",
+  "agent_settled",
+  "auto_compaction_end",
+  "compaction_end",
+]);
+
+export interface RpcSessionStartOptions {
+  toolNames?: string[];
+  initialModel?: { provider: string; modelId: string };
+  thinkingLevel?: ThinkingLevel;
+}
 
 const CODING_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
@@ -169,7 +196,8 @@ export class AgentSessionWrapper {
   private unsubscribe: (() => void) | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private onDestroyCallback: (() => void) | null = null;
-  private askUserQuestionBridge: AskUserQuestionBridge | null = null; // [ask-user-question-bridge]
+  private askUserQuestionBridge: AskUserQuestionBridge | null = null; // [ask-u*******************[REDACTED:OpenAI/Anthropic API Key]]
+  private shutdownPromise: Promise<void> | null = null;
   private _alive = true;
 
   constructor(public readonly inner: AgentSessionLike, askUserQuestionEventBus?: AskUserQuestionEventBusLike) {
@@ -191,6 +219,10 @@ export class AgentSessionWrapper {
     return this.inner.sessionFile ?? "";
   }
 
+  get cwd(): string {
+    return this.inner.sessionManager.getCwd();
+  }
+
   isAlive(): boolean {
     return this._alive;
   }
@@ -201,14 +233,12 @@ export class AgentSessionWrapper {
 
   start(): void {
     this.unsubscribe = this.inner.subscribe((event: AgentEvent) => {
-      this.resetIdleTimer();
       if (event.type === "agent_end") {
         invalidateSessionListCache();
       }
+      if (IDLE_RESET_EVENT_TYPES.has(event.type)) this.resetIdleTimer();
       this.emit(event);
-      // Streaming / compaction / tool events flow through here; re-broadcast
-      // the running-status snapshot so the sidebar can update live.
-      notifyRunningChange();
+      if (RUNNING_STATE_EVENT_TYPES.has(event.type)) notifyRunningChange();
     });
     this.resetIdleTimer();
     notifyRunningChange();
@@ -223,6 +253,10 @@ export class AgentSessionWrapper {
     void this.ensureExtensionsBound(options).catch((err) => {
       console.error("[pi-web] failed to dispatch session_start to extensions:", err instanceof Error ? err.message : err);
     });
+  }
+
+  async waitUntilReady(): Promise<void> {
+    await this.waitForExtensionsBound();
   }
 
   private ensureExtensionsBound(options: ExtensionBindingOptions = {}): Promise<void> {
@@ -254,7 +288,7 @@ export class AgentSessionWrapper {
             id: randomUUID(),
             method: "notify",
             notifyType: "warning",
-            message: "Extension requested shutdown, but shutdown is not supported in pi-web.",
+            message: "Extension requested shutdown, but shutdown is not supported in Pi Web.",
           } as ExtensionUiRequest as AgentEvent),
           onError: (error) => this.emit({
             type: "extension_error",
@@ -298,6 +332,7 @@ export class AgentSessionWrapper {
     try {
       return await operation();
     } finally {
+      this.resetIdleTimer();
       notifyRunningChange();
     }
   }
@@ -332,7 +367,9 @@ export class AgentSessionWrapper {
         this.resetIdleTimer();
         return;
       }
-      this.destroy();
+      void this.shutdown().catch((error) => {
+        console.error("[pi-web] failed to shut down idle session:", error instanceof Error ? error.message : error);
+      });
     }, 10 * 60 * 1000);
   }
 
@@ -379,6 +416,11 @@ export class AgentSessionWrapper {
     const type = command.type as string;
     if (this.shouldWaitForExtensions(type)) await this.waitForExtensionsBound();
 
+    if (type === "prompt" || type === "steer" || type === "follow_up") {
+      const imageError = validateAgentImages(command.images);
+      if (imageError) throw new Error(imageError);
+    }
+
     switch (type) {
       case "prompt": {
         if (this.inner.isBashRunning) {
@@ -395,10 +437,12 @@ export class AgentSessionWrapper {
           source: "rpc",
         }).then(() => {
           this.promptRunning = false;
+          this.resetIdleTimer();
           if (!streamingBehavior) this.emit({ type: "prompt_done" });
           notifyRunningChange();
         }).catch((error) => {
           this.promptRunning = false;
+          this.resetIdleTimer();
           invalidateSessionListCache();
           this.emit({
             type: "prompt_error",
@@ -448,7 +492,11 @@ export class AgentSessionWrapper {
 
       case "set_model": {
         const { provider, modelId } = command as { provider: string; modelId: string };
-        const model = this.inner.modelRuntime.getModel(provider, modelId);
+        let model = this.inner.modelRuntime.getModel(provider, modelId);
+        if (!model) {
+          await this.inner.modelRuntime.refresh({ allowNetwork: false });
+          model = this.inner.modelRuntime.getModel(provider, modelId);
+        }
         if (!model) throw new Error(`Model not found: ${provider}/${modelId}`);
         await this.inner.setModel(model);
         invalidateModelsCache();
@@ -489,7 +537,7 @@ export class AgentSessionWrapper {
         const newSessionId = SessionManager.open(newSessionFile, sessionDir).getSessionId();
         cacheSessionPath(newSessionId, newSessionFile);
         invalidateSessionListCache();
-        this.destroy();
+        await this.shutdown();
         return { cancelled: false, newSessionId };
       }
 
@@ -617,11 +665,13 @@ export class AgentSessionWrapper {
         await this.waitForExtensionsBound();
         this.extensionStatuses.clear();
         this.extensionWidgets.clear();
+        this.syncProjectTrust();
         await this.inner.reload();
         if (typeof this.inner.bindExtensions !== "function") {
           this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
         }
         this.applyForcedEmptySystemPrompt();
+        invalidateModelsCache();
         return { success: true };
       }
 
@@ -660,6 +710,7 @@ export class AgentSessionWrapper {
           this.persistBashOnlySession();
           return result;
         } finally {
+          this.resetIdleTimer();
           invalidateSessionListCache();
           notifyRunningChange();
         }
@@ -686,8 +737,37 @@ export class AgentSessionWrapper {
     for (const id of Array.from(this.activeCustomUis.keys())) this.closeCustomUi(id, undefined);
     this.pendingUiResponses.clear();
     this.pendingUiRequests.clear();
-    this.onDestroyCallback?.();
-    notifyRunningChange();
+    try {
+      this.inner.dispose();
+    } finally {
+      try {
+        this.onDestroyCallback?.();
+      } finally {
+        notifyRunningChange();
+      }
+    }
+  }
+
+  async shutdown(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    if (!this._alive) return;
+
+    this.shutdownPromise = (async () => {
+      try {
+        try {
+          await this.waitForExtensionsBound();
+        } catch (error) {
+          console.error(
+            "[pi-web] extension binding failed before session shutdown:",
+            error instanceof Error ? error.message : error,
+          );
+        }
+        await this.inner.extensionRunner.emit?.({ type: "session_shutdown", reason: "quit" });
+      } finally {
+        this.destroy();
+      }
+    })();
+    return this.shutdownPromise;
   }
 
   private resolveExtensionUiResponse(response: ExtensionUiResponse): void {
@@ -867,7 +947,6 @@ export class AgentSessionWrapper {
         signal?.removeEventListener("abort", onAbort);
         this.pendingUiRequests.delete(id);
         this.pendingUiResponses.delete(id);
-        this.pendingUiRequests.delete(id);
       };
       const settle = (value: T) => {
         cleanup();
@@ -1007,7 +1086,7 @@ export class AgentSessionWrapper {
       get theme() { return PLAIN_TEXT_THEME; },
       getAllThemes: () => [],
       getTheme: () => undefined,
-      setTheme: () => ({ success: false, error: "Theme switching is not supported in pi-web extension UI yet" }),
+      setTheme: () => ({ success: false, error: "Theme switching is not supported in Pi Web extension UI yet" }),
       getToolsExpanded: () => false,
       setToolsExpanded: () => {},
     };
@@ -1029,6 +1108,7 @@ export class AgentSessionWrapper {
       reload: async () => {
         this.extensionStatuses.clear();
         this.extensionWidgets.clear();
+        this.syncProjectTrust();
         await this.inner.reload({
           beforeSessionStart: () => {
             this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
@@ -1037,6 +1117,11 @@ export class AgentSessionWrapper {
         this.applyForcedEmptySystemPrompt();
       },
     };
+  }
+
+  private syncProjectTrust(): void {
+    const status = getProjectTrustStatus(this.cwd, getAgentDir());
+    this.inner.settingsManager.setProjectTrusted(status.trusted);
   }
 }
 
@@ -1047,6 +1132,7 @@ export class AgentSessionWrapper {
 declare global {
   var __piSessions: Map<string, AgentSessionWrapper> | undefined;
   var __piStartLocks: Map<string, Promise<{ session: AgentSessionWrapper; realSessionId: string }>> | undefined;
+  var __piStartingSessionCwds: Map<string, number> | undefined;
   var __piRunningListeners: Set<(ids: string[]) => void> | undefined;
 }
 
@@ -1066,8 +1152,50 @@ function getLocks(): Map<string, Promise<{ session: AgentSessionWrapper; realSes
   return globalThis.__piStartLocks;
 }
 
+function normalizeRpcCwd(cwd: string): string {
+  const resolvedCwd = resolve(cwd);
+  try {
+    return realpathSync(resolvedCwd);
+  } catch {
+    return resolvedCwd;
+  }
+}
+
+function getStartingSessionCwds(): Map<string, number> {
+  if (!globalThis.__piStartingSessionCwds) globalThis.__piStartingSessionCwds = new Map();
+  return globalThis.__piStartingSessionCwds;
+}
+
+function trackStartingSession(cwd: string): () => void {
+  const startingCwds = getStartingSessionCwds();
+  const key = normalizeRpcCwd(cwd);
+  startingCwds.set(key, (startingCwds.get(key) ?? 0) + 1);
+  return () => {
+    const remaining = (startingCwds.get(key) ?? 1) - 1;
+    if (remaining > 0) startingCwds.set(key, remaining);
+    else startingCwds.delete(key);
+  };
+}
+
 export function getRpcSession(sessionId: string): AgentSessionWrapper | undefined {
   return getRegistry().get(sessionId);
+}
+
+export function hasBusyRpcSessionForCwd(cwd: string): boolean {
+  const targetCwd = normalizeRpcCwd(cwd);
+  if (getStartingSessionCwds().has(targetCwd)) return true;
+  return Array.from(getRegistry().values()).some(
+    (session) => normalizeRpcCwd(session.cwd) === targetCwd && session.isRunning(),
+  );
+}
+
+export async function destroyRpcSessionsForCwd(cwd: string): Promise<number> {
+  const targetCwd = normalizeRpcCwd(cwd);
+  const sessions = Array.from(getRegistry().values()).filter(
+    (session) => normalizeRpcCwd(session.cwd) === targetCwd,
+  );
+  await Promise.all(sessions.map((session) => session.shutdown()));
+  return sessions.length;
 }
 
 export function getRunningRpcSessionIds(): string[] {
@@ -1103,116 +1231,40 @@ let lastRunningSnapshot = "";
 
 /**
  * Recompute the running-session-id set and, if it changed since the last
- * notification, broadcast it to subscribers. Cheap to call often.
+ * notification, broadcast it to subscribers.
  */
 export function notifyRunningChange(): void {
+  const listeners = getRunningListeners();
+  if (listeners.size === 0) {
+    // A future subscriber receives its own initial snapshot. Clear this one so
+    // its first state transition cannot match stale state from an old listener.
+    lastRunningSnapshot = "";
+    return;
+  }
   const ids = getRunningRpcSessionIds();
   const snapshot = JSON.stringify([...ids].sort());
   if (snapshot === lastRunningSnapshot) return;
   lastRunningSnapshot = snapshot;
-  for (const listener of getRunningListeners()) {
+  for (const listener of listeners) {
     try { listener(ids); } catch { /* ignore listener errors */ }
-  }
-}
-
-/**
- * Reconcile the in-memory model after `createAgentSession` reloads an existing session.
- *
- * `startRpcSession` calls `createAgentSession` without an explicit `model`, so the SDK runs
- * `findInitialModel`. That calls `modelRegistry.find(settingsDefault)` BEFORE the registry is
- * fully populated, the find returns undefined, and `findInitialModel` falls back to an arbitrary
- * built-in model — `openrouter/moonshotai/kimi-k2.6` — ignoring the user's `defaultModel` +
- * `enabledModels` + `enabledProviders`. `/api/agent/new` corrects this for brand-new sessions
- * with an explicit `set_model`, but that route is NOT used when an idle `AgentSessionWrapper`
- * (10-min idle timeout) is destroyed and the next request reloads the session from disk here.
- * Without reconciliation the reloaded session silently runs on kimi-k2.6 even though the
- * session file (and the UI selector, which reads the file) still show the user's chosen model.
- *
- * Restore the model the session was actually using (the last `model_change` in the file) when it
- * is still registered; otherwise fall back to the scoped default (mirroring GET /api/models and
- * /api/agent/new). Set `agent.state.model` directly rather than calling `setModel` — `setModel`
- * would append a redundant `model_change` and persist the model as the global `defaultModel` in
- * settings.json on every reload, which an automatic fix must not do.
- */
-async function reconcileReloadedModel(
-  inner: AgentSessionLike,
-  sessionManager: SessionManager,
-): Promise<void> {
-  try {
-    const ctx = sessionManager.buildSessionContext();
-    const recorded = ctx.model as { provider: string; modelId: string } | undefined;
-    const current = inner.model;
-
-    let desired: { provider: string; modelId: string } | null = null;
-    if (recorded) {
-      if (current && current.provider === recorded.provider && current.id === recorded.modelId) return;
-      if (inner.modelRuntime.getModel(recorded.provider, recorded.modelId)) {
-        desired = { provider: recorded.provider, modelId: recorded.modelId };
-      }
-    }
-    if (!desired) desired = await resolveScopedDefaultModelFromInner(inner);
-    if (!desired) return;
-    if (current && current.provider === desired.provider && current.id === desired.modelId) return;
-
-    const model = inner.modelRuntime.getModel(desired.provider, desired.modelId);
-    if (!model) return;
-
-    const state = inner.agent.state as unknown as
-      | { model: ModelLike; thinkingLevel: string }
-      | undefined;
-    if (!state) return;
-    state.model = model;
-    // Deliberately NOT re-clamping state.thinkingLevel for the corrected model. Re-clamping
-    // would route through setThinkingLevel, which writes defaultThinkingLevel to settings.json
-    // (and appends a thinking_level_change) on any real change — a silent global-settings
-    // mutation on every reload, which an automatic fix must not do. The provider clamps the
-    // level to the corrected model's supported set at request time (per the SDK's own
-    // getAvailableThinkingLevels comment), so leaving the SDK's value matches its restore
-    // behavior and avoids the side effect. In the scoped-default fallback (recorded model no
-    // longer registered) the file still records the old model while the session runs on the
-    // scoped default — strictly better than kimi, and the user's next explicit model pick
-    // appends the correcting model_change.
-  } catch {
-    // Best-effort: never break session creation over a model fix.
-  }
-}
-
-/**
- * Resolve the scoped default model from a live session's own services — the fallback when a
- * reloaded session's recorded model is no longer registered. Mirrors the scoped-default logic
- * in GET /api/models and app/api/agent/new/route.ts (settings default if in the scoped set,
- * else the first scoped model).
- */
-async function resolveScopedDefaultModelFromInner(
-  inner: AgentSessionLike,
-): Promise<{ provider: string; modelId: string } | null> {
-  try {
-    const available = await inner.modelRuntime.getAvailable();
-    const scoped = scopeAvailableModels(available, inner.settingsManager);
-    const dp = inner.settingsManager.getDefaultProvider();
-    const dm = inner.settingsManager.getDefaultModel();
-    if (dp && dm && scoped.some((m) => m.provider === dp && m.id === dm)) {
-      return { provider: dp, modelId: dm };
-    }
-    if (scoped.length > 0) return { provider: scoped[0].provider, modelId: scoped[0].id };
-    return null;
-  } catch {
-    return null;
   }
 }
 
 /**
  * Get or create an AgentSession for the given session.
  * For new sessions (sessionFile === ""), pi generates its own id.
- * Pass toolNames to pre-configure active tools (empty array = all tools disabled).
+ * New sessions resolve enabledModels before construction so the initial model,
+ * thinking pin, and SDK scopedModels share one settings snapshot.
+ * Pass options.toolNames to pre-configure active tools (empty = all disabled).
  */
 export async function startRpcSession(
   sessionId: string,
   sessionFile: string,
-  cwd: string,
-  toolNames?: string[]
+  cwd: string | undefined,
+  options: RpcSessionStartOptions = {},
 ): Promise<{ session: AgentSessionWrapper; realSessionId: string }> {
   if (!process.env.PI_SUBAGENT_PI_COMMAND) await ensureSubagentPiCommand();
+  const { toolNames, initialModel, thinkingLevel } = options;
   const registry = getRegistry();
   const locks = getLocks();
 
@@ -1222,21 +1274,25 @@ export async function startRpcSession(
   const inflight = locks.get(sessionId);
   if (inflight) return inflight;
 
+  let sessionManager: SessionManager;
+  if (sessionFile) {
+    sessionManager = SessionManager.open(sessionFile, undefined);
+  } else {
+    if (!cwd) throw new Error("cwd is required for a new session");
+    sessionManager = SessionManager.create(cwd, undefined);
+  }
+  const sessionCwd = sessionManager.getCwd();
+  const finishStartingSession = trackStartingSession(sessionCwd);
   const starting = (async () => {
     // Some extensions access the SDK's global theme even outside the terminal UI.
     initTheme();
     const agentDir = getAgentDir();
 
-    const sessionManager = sessionFile
-      ? SessionManager.open(sessionFile, undefined)
-      : SessionManager.create(cwd, undefined);
-
-    // [ask-user-question-bridge] share one EventBus with the SDK so we can observe the
+    // [ask-u*******************[REDACTED:OpenAI/Anthropic API Key]] share one EventBus with the SDK so we can observe the
     // extension's ASK_USER_PROMPT_EVENT before it calls ctx.ui.custom(). Inject it via
     // resourceLoaderOptions.eventBus (the SDK wires pi.events to the resource loader's
     // bus); the same bus is handed to AgentSessionWrapper below for the bridge to subscribe.
     const askUserQuestionEventBus = createAskUserQuestionEventBus();
-
     // Determine which tools to pass based on requested toolNames.
     // Since v0.68.0, session creation expects string[] tool names instead of Tool[] instances.
     let toolsOption: string[] | undefined;
@@ -1245,7 +1301,7 @@ export async function startRpcSession(
       // Otherwise DO NOT pass a builtin-only allow-list: passing CODING_TOOL_NAMES
       // set allowedToolNames to coding builtins only, which filtered every
       // extension/package-provided tool (e.g. subagents, web access) out of the
-      // tool registry — so they were unavailable in pi-web sessions even though the
+      // tool registry — so they were unavailable in Pi Web sessions even though the
       // `pi` CLI keeps them. Leaving the allow-list unset lets the SDK register all
       // tools (and activate extension tools); we narrow the ACTIVE set below.
       toolsOption = toolNames.length === 0 ? [] : undefined;
@@ -1253,16 +1309,59 @@ export async function startRpcSession(
 
     // Build services first so extension-registered providers are available
     // before the SDK restores the saved model from the session file.
-    const services = await createAgentSessionServices({ cwd, agentDir, ...(askUserQuestionEventBus ? { resourceLoaderOptions: { eventBus: askUserQuestionEventBus } } : {}) });
+    // Gate untrusted project extensions so opening a repository does not run
+    // its .pi/extensions code automatically (see lib/project-trust.ts, #236).
+    const trustReloadOptions = projectTrustReloadOptions(sessionCwd, agentDir);
+    const services = await createAgentSessionServices({
+      cwd: sessionCwd,
+      agentDir,
+      ...(trustReloadOptions ? { resourceLoaderReloadOptions: trustReloadOptions } : {}),
+      ...(askUserQuestionEventBus ? { resourceLoaderOptions: { eventBus: askUserQuestionEventBus } } : {}),
+    });
+    const scope = await resolveVisibleModels(
+      services.modelRuntime,
+      services.settingsManager.getEnabledModels(),
+    );
+    const defaultProvider = services.settingsManager.getDefaultProvider();
+    const defaultModelId = services.settingsManager.getDefaultModel();
+    const hasExistingMessages = sessionManager.getBranch().some((entry) => entry.type === "message");
+    const initial = hasExistingMessages
+      ? { scopedModels: [...scope.scopedModels] }
+      : selectInitialModelScope(scope, {
+        ...(initialModel ? { requestedModel: initialModel } : {}),
+        ...(defaultProvider && defaultModelId
+          ? { defaultModel: { provider: defaultProvider, modelId: defaultModelId } }
+          : {}),
+        ...(thinkingLevel ? { thinkingLevel } : {}),
+      });
     const { session: inner } = await createAgentSessionFromServices({
       services,
       sessionManager,
+      ...(initial.model ? { model: initial.model } : {}),
+      ...(initial.thinkingLevel ? { thinkingLevel: initial.thinkingLevel } : {}),
+      ...(initial.scopedModels.length > 0 ? { scopedModels: initial.scopedModels } : {}),
       ...(toolsOption !== undefined ? { tools: toolsOption } : {}),
     });
 
+    const persistedPreferences = await persistExplicitStartupPreferences(
+      services.settingsManager,
+      {
+        ...(initialModel ? { model: initialModel } : {}),
+        ...(thinkingLevel ? { thinkingLevel } : {}),
+      },
+      {
+        ...(inner.model
+          ? { model: { provider: inner.model.provider, modelId: inner.model.id } }
+          : {}),
+        thinkingLevel: inner.thinkingLevel,
+        supportsThinking: inner.supportsThinking(),
+      },
+    );
+    if (persistedPreferences.modelDefaultChanged) invalidateModelsCache();
+
     // If specific tool names were requested (non-empty), set the active tools to the
     // requested builtin coding tools PLUS all extension/package tools, so installed
-    // extensions stay usable in pi-web just like in the `pi` CLI.
+    // extensions stay usable in Pi Web just like in the `pi` CLI.
     if (toolNames && toolNames.length > 0) {
       inner.setActiveToolsByName(withExtensionTools(inner, toolNames));
     }
@@ -1275,12 +1374,6 @@ export async function startRpcSession(
       wrapper.setForceEmptySystemPrompt(true);
     }
 
-    // Reloaded sessions: reconcile the in-memory model the SDK's findInitialModel picked wrongly
-    // (kimi-k2.6). Brand-new sessions (sessionFile === "") are corrected by /api/agent/new's
-    // explicit set_model, so this is reload-only — see reconcileReloadedModel for the full why.
-    if (sessionFile) {
-      await reconcileReloadedModel(inner, sessionManager);
-    }
     wrapper.start();
 
     const realSessionId = inner.sessionId as string;
@@ -1292,7 +1385,10 @@ export async function startRpcSession(
     wrapper.beginExtensionBinding({ forceEmptySystemPrompt: toolNames?.length === 0 });
 
     return { session: wrapper, realSessionId };
-  })().finally(() => locks.delete(sessionId));
+  })().finally(() => {
+    locks.delete(sessionId);
+    finishStartingSession();
+  });
 
   locks.set(sessionId, starting);
   return starting;

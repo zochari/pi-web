@@ -1,44 +1,24 @@
 import { NextResponse } from "next/server";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { existsSync } from "fs";
+import { randomUUID } from "crypto";
 import { allowFileRoot } from "@/lib/file-access";
 import { invalidateSessionListCache } from "@/lib/session-reader";
 import { startRpcSession } from "@/lib/rpc-manager";
-import { createAgentSessionServices, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { scopeAvailableModels } from "@/lib/model-scope";
 
-/**
- * Resolve the default model for a new session, scoped to the user's enabledModels
- * + enabledProviders whitelists (mirrors GET /api/models). Returns the settings default
- * if available in the scoped set, else the first scoped model. Used when the client
- * creates a session without specifying a model, so the SDK's findInitialModel doesn't
- * fall through to an arbitrary openrouter model (openrouter/moonshotai/kimi-k2.6) and
- * ignore the user's settings defaultModel + enabledModels + enabledProviders.
- */
-async function resolveScopedDefaultModel(cwd: string): Promise<{ provider: string; modelId: string } | null> {
-  try {
-    const agentDir = getAgentDir();
-    const services = await createAgentSessionServices({ cwd, agentDir });
-    const settings = services.settingsManager;
-    const available = await services.modelRuntime.getAvailable();
-    const scoped = scopeAvailableModels(available, settings);
-    const dp = settings.getDefaultProvider();
-    const dm = settings.getDefaultModel();
-    if (dp && dm && scoped.some((m) => m.provider === dp && m.id === dm)) {
-      return { provider: dp, modelId: dm };
-    }
-    if (scoped.length > 0) {
-      return { provider: scoped[0].provider, modelId: scoped[0].id };
-    }
-    return null;
-  } catch {
-    return null;
+const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+function parseThinkingLevel(value: unknown): ThinkingLevel | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "string" && THINKING_LEVELS.has(value as ThinkingLevel)) {
+    return value as ThinkingLevel;
   }
+  throw new Error(`Invalid thinking level: ${String(value)}`);
 }
-
 // POST /api/agent/new  body: { cwd: string; type: string; message?: string; ... }
 // Spawns a brand-new pi session. Most calls immediately send the first command;
 // type:"ensure_session" only creates the runtime so clients can query commands.
-// Returns { sessionId, data } where sessionId is pi's real session id.
+// Returns pi's real session id plus the model/thinking state selected at startup.
 export async function POST(req: Request) {
   try {
     const body = await req.json() as { cwd?: string; [key: string]: unknown };
@@ -52,10 +32,21 @@ export async function POST(req: Request) {
     }
 
     // Use a one-time key so startRpcSession's lock doesn't conflict with real session ids
-    const { provider, modelId, toolNames, thinkingLevel, ...promptCommand } = command as { provider?: string; modelId?: string; toolNames?: string[]; thinkingLevel?: string; [key: string]: unknown };
+    const { provider, modelId, toolNames, thinkingLevel, ...promptCommand } = command as { provider?: string; modelId?: string; toolNames?: string[]; thinkingLevel?: unknown; [key: string]: unknown };
+    if ((provider && !modelId) || (!provider && modelId)) {
+      throw new Error("provider and modelId must be provided together");
+    }
+    const explicitThinkingLevel = parseThinkingLevel(thinkingLevel);
 
-    const tempKey = `__new__${Date.now()}`;
-    const { session, realSessionId } = await startRpcSession(tempKey, "", cwd, toolNames);
+    // Must be unique per request: startRpcSession coalesces concurrent callers
+    // that share a key onto one session. Date.now() (ms resolution) collides for
+    // requests in the same millisecond, merging two new sessions into one.
+    const tempKey = `__new__${randomUUID()}`;
+    const { session, realSessionId } = await startRpcSession(tempKey, "", cwd, {
+      ...(toolNames ? { toolNames } : {}),
+      ...(provider && modelId ? { initialModel: { provider, modelId } } : {}),
+      ...(explicitThinkingLevel ? { thinkingLevel: explicitThinkingLevel } : {}),
+    });
 
     // Keep the files-route allowed-roots cache (see app/api/files/[...path]/route.ts)
     // in sync so the new cwd is immediately readable via /api/files. Without this,
@@ -63,31 +54,34 @@ export async function POST(req: Request) {
     allowFileRoot(cwd);
     invalidateSessionListCache();
 
-    // Apply pre-selected model before sending the prompt. If the client sent no model
-    // (e.g. the /api/models fetch hadn't resolved yet), fall back to the scoped default
-    // — otherwise the SDK's findInitialModel picks an arbitrary openrouter model
-    // (openrouter/moonshotai/kimi-k2.6), ignoring settings defaultModel + enabledModels.
-    if (provider && modelId) {
-      await session.send({ type: "set_model", provider, modelId });
-    } else {
-      const fallback = await resolveScopedDefaultModel(cwd);
-      if (fallback) {
-        await session.send({ type: "set_model", provider: fallback.provider, modelId: fallback.modelId });
-      }
-    }
-
-    // Apply pre-selected thinking level before sending the prompt
-    if (thinkingLevel) {
-      await session.send({ type: "set_thinking_level", level: thinkingLevel });
-    }
+    const state = await session.send({ type: "get_state" }) as {
+      model?: { id: string; provider: string };
+      thinkingLevel?: string;
+    };
 
     if (promptCommand.type === "ensure_session") {
-      return NextResponse.json({ success: true, sessionId: realSessionId, data: null });
+      return NextResponse.json({
+        success: true,
+        sessionId: realSessionId,
+        data: null,
+        model: state.model
+          ? { provider: state.model.provider, modelId: state.model.id }
+          : null,
+        thinkingLevel: state.thinkingLevel,
+      });
     }
 
     const result = await session.send(promptCommand);
 
-    return NextResponse.json({ success: true, sessionId: realSessionId, data: result });
+    return NextResponse.json({
+      success: true,
+      sessionId: realSessionId,
+      data: result,
+      model: state.model
+        ? { provider: state.model.provider, modelId: state.model.id }
+        : null,
+      thinkingLevel: state.thinkingLevel,
+    });
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });
   }

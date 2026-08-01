@@ -2,8 +2,10 @@ import { stat } from "fs/promises";
 import { resolve } from "path";
 import { createAgentSessionServices, getAgentDir, type SettingsManager } from "@earendil-works/pi-coding-agent";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
-import { loadModelsWithCache, type ModelsData } from "@/lib/models-cache";
-import { scopeAvailableModels } from "@/lib/model-scope";
+import { loadModelsWithCache, withModelRuntimeError, type ModelsData } from "@/lib/models-cache";
+import { resolveVisibleModels, selectInitialModelScope } from "@/lib/model-scope";
+import { getAllowedFileRoots, isExistingFilePathAllowed } from "@/lib/file-access";
+import { projectTrustReloadOptions } from "@/lib/project-trust";
 
 export const dynamic = "force-dynamic";
 
@@ -26,34 +28,59 @@ async function loadModels(cwd: string): Promise<ModelsData> {
   const thinkingLevelMaps: Record<string, Record<string, string | null>> = {};
 
   const agentDir = getAgentDir();
-  const services = await createAgentSessionServices({ cwd, agentDir });
-  const available = await services.modelRuntime.getAvailable();
+  // Gate untrusted project extensions: enumerating models still imports and
+  // runs a repository's .pi/extensions factories, so honor project trust here
+  // too (see lib/project-trust.ts, #236).
+  const trustReloadOptions = projectTrustReloadOptions(cwd, agentDir);
+  const services = await createAgentSessionServices({
+    cwd,
+    agentDir,
+    ...(trustReloadOptions ? { resourceLoaderReloadOptions: trustReloadOptions } : {}),
+  });
+  const modelError = services.modelRuntime.getError();
   const settings: SettingsManager = services.settingsManager;
-  // Scope the picker to the user's enabled models (matches the pi CLI). This mirrors
-  // resolveScopedDefaultModel (app/api/agent/new/route.ts) and the reload-path
-  // resolveScopedDefaultModelFromInner (lib/rpc-manager.ts) so the picker and the
-  // new-session default stay in sync — diverging here reintroduces the class of
-  // bug the reloaded-model fix addresses.
-  const scoped = scopeAvailableModels(available, settings);
-  modelList = scoped.map((m: { id: string; name: string; provider: string }) => ({
+  // `enabledModels` supports globs and fuzzy patterns, so resolve it the same
+  // way the CLI does instead of comparing pattern strings literally (#307).
+  const scope = await resolveVisibleModels(
+    services.modelRuntime,
+    settings.getEnabledModels(),
+  );
+  const { visible, thinkingLevelPins, warnings } = scope;
+  modelList = visible.map((m) => ({
     id: m.id,
     name: m.name,
     provider: m.provider,
   })).sort(compareModelEntries);
-  for (const m of scoped) {
+  for (const m of visible) {
     const key = `${m.provider}:${m.id}`;
     nameMap.set(key, m.name);
     thinkingLevels[key] = getSupportedThinkingLevels(m);
     if (m.thinkingLevelMap) thinkingLevelMaps[key] = m.thinkingLevelMap;
   }
 
-  const provider = settings.getDefaultProvider();
-  const modelId = settings.getDefaultModel();
-  if (provider && modelId && scoped.some((m) => m.provider === provider && m.id === modelId)) {
-    defaultModel = { provider, modelId };
+  const defaultProvider = settings.getDefaultProvider();
+  const defaultModelId = settings.getDefaultModel();
+  const initial = selectInitialModelScope(scope, {
+    ...(defaultProvider && defaultModelId
+      ? { defaultModel: { provider: defaultProvider, modelId: defaultModelId } }
+      : {}),
+  });
+  if (initial.model) {
+    defaultModel = { provider: initial.model.provider, modelId: initial.model.id };
   }
 
-  return { models: Object.fromEntries(nameMap), modelList, defaultModel, thinkingLevels, thinkingLevelMaps };
+  return withModelRuntimeError(
+    {
+      models: Object.fromEntries(nameMap),
+      modelList,
+      defaultModel,
+      thinkingLevels,
+      thinkingLevelMaps,
+      thinkingLevelPins,
+      ...(warnings.length > 0 ? { modelScopeWarnings: warnings } : {}),
+    },
+    modelError,
+  );
 }
 
 const EMPTY_MODELS: ModelsData = {
@@ -62,6 +89,7 @@ const EMPTY_MODELS: ModelsData = {
   defaultModel: null,
   thinkingLevels: {},
   thinkingLevelMaps: {},
+  thinkingLevelPins: {},
 };
 
 export async function GET(req: Request) {
@@ -76,6 +104,10 @@ export async function GET(req: Request) {
   }
   if (!cwdStat.isDirectory()) {
     return Response.json({ error: `Not a directory: ${cwd}` }, { status: 400 });
+  }
+  const allowedRoots = await getAllowedFileRoots();
+  if (!isExistingFilePathAllowed(cwd, allowedRoots)) {
+    return Response.json({ error: "Access denied" }, { status: 403 });
   }
 
   try {
