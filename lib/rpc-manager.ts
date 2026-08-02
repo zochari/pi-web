@@ -14,8 +14,6 @@ import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./pi-types";
 import type { ExtensionUiRequest, ExtensionUiResponse, ExtensionWidgetItem } from "./types";
 import { createHeadlessCustomUiTui, DEFAULT_CUSTOM_UI_COLUMNS } from "./custom-ui-terminal";
-// [ask-user-question-bridge] see lib/ask-user-question-bridge/ for full context; remove this import to fully disable.
-import { AskUserQuestionBridge, createAskUserQuestionEventBus, type AskUserQuestionEventBusLike } from "./ask-user-question-bridge";
 
 // ============================================================================
 // Types
@@ -174,16 +172,11 @@ async function ensureSubagentPiCommand(): Promise<void> {
 
 // ============================================================================
 // AgentSessionWrapper
-// Wraps AgentSession with the same interface the rest of the app expects
 // ============================================================================
 
 export class AgentSessionWrapper {
   private listeners: EventListener[] = [];
   private pendingUiResponses = new Map<string, PendingUiResponse>();
-  // Pending extension_ui_request events awaiting a browser response. Replayed to
-  // reconnecting SSE clients (onEvent) and surfaced via get_state, so a page refresh
-  // re-shows an unanswered ask_user_question / select / confirm / input / editor
-  // dialog instead of leaving the agent blocked on a prompt the UI can no longer see.
   private pendingUiRequests = new Map<string, AgentEvent>();
   private activeCustomUis = new Map<string, ActiveCustomUi>();
   private extensionStatuses = new Map<string, string>();
@@ -196,20 +189,10 @@ export class AgentSessionWrapper {
   private unsubscribe: (() => void) | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private onDestroyCallback: (() => void) | null = null;
-  private askUserQuestionBridge: AskUserQuestionBridge | null = null; // [ask-u*******************[REDACTED:OpenAI/Anthropic API Key]]
   private shutdownPromise: Promise<void> | null = null;
   private _alive = true;
 
-  constructor(public readonly inner: AgentSessionLike, askUserQuestionEventBus?: AskUserQuestionEventBusLike) {
-    // Wire the AskUserQuestion bridge into ctx.ui.custom() interception.
-    if (askUserQuestionEventBus) {
-      this.askUserQuestionBridge = new AskUserQuestionBridge(askUserQuestionEventBus, {
-        emit: (event) => this.emit(event as AgentEvent),
-        registerPending: (id, resolve, cancel) => this.pendingUiResponses.set(id, { resolve: resolve as PendingUiResponse["resolve"], cancel }),
-      });
-    }
-    this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
-  }
+  constructor(public readonly inner: AgentSessionLike) {}
 
   get sessionId(): string {
     return this.inner.sessionId;
@@ -344,19 +327,6 @@ export class AgentSessionWrapper {
   }
 
   private emit(event: AgentEvent): void {
-    // [ask-user-question-bridge] Cache pending UI requests (those registered in
-    // pendingUiResponses) so they can be replayed to reconnecting clients. Fire-and-
-    // forget requests (notify/setStatus/setWidget/setTitle/set_editor_text) are never
-    // registered, so they are correctly excluded. Both pending paths (requestExtensionUi
-    // and the ask-user-question bridge) call pendingUiResponses.set(id) before emitting,
-    // so the gate is satisfied at emit time.
-    if (
-      event.type === "extension_ui_request" &&
-      typeof event.id === "string" &&
-      this.pendingUiResponses.has(event.id)
-    ) {
-      this.pendingUiRequests.set(event.id, event);
-    }
     for (const l of this.listeners) l(event);
   }
 
@@ -395,12 +365,7 @@ export class AgentSessionWrapper {
 
   onEvent(listener: EventListener): () => void {
     this.listeners.push(listener);
-    // Replay pending UI requests to a reconnecting client so the dialog is re-surfaced
-    // bound to the same id — answering still resolves the agent's blocked call. Full
-    // page refreshes are covered by get_state hydration on mount; this handles
-    // transient SSE reconnects that don't trigger a remount. The agent is blocked
-    // while these are pending, so no new events race the replay.
-    for (const request of this.pendingUiRequests.values()) listener(request);
+    for (const event of this.pendingUiRequests.values()) listener(event);
     return () => {
       const i = this.listeners.indexOf(listener);
       if (i !== -1) this.listeners.splice(i, 1);
@@ -484,9 +449,6 @@ export class AgentSessionWrapper {
           thinkingLevel: this.inner.agent.state?.thinkingLevel ?? "off",
           extensionStatuses: this.getExtensionStatuses(),
           extensionWidgets: this.getExtensionWidgets(),
-          // [ask-user-question-bridge] Pending UI requests the agent is blocked on, so a
-          // reconnecting/reloading client can re-surface the dialog (see useAgentSession).
-          pendingUiRequests: Array.from(this.pendingUiRequests.values()),
         };
       }
 
@@ -732,7 +694,6 @@ export class AgentSessionWrapper {
     if (this.idleTimer) clearTimeout(this.idleTimer);
     if (this.inner.isBashRunning) this.inner.abortBash();
     this.unsubscribe?.();
-    this.askUserQuestionBridge?.dispose(); // [ask-user-question-bridge]
     for (const pending of this.pendingUiResponses.values()) pending.cancel();
     for (const id of Array.from(this.activeCustomUis.keys())) this.closeCustomUi(id, undefined);
     this.pendingUiResponses.clear();
@@ -774,11 +735,6 @@ export class AgentSessionWrapper {
     const pending = this.pendingUiResponses.get(response.id);
     if (!pending) return;
     pending.resolve(response);
-    // [ask-user-question-bridge] Drop both maps so the answered request is never replayed
-    // to a future reconnecting client. Also closes a pre-existing leak for the
-    // ask-user-question path, whose resolver did not delete its pendingUiResponses entry.
-    this.pendingUiResponses.delete(response.id);
-    this.pendingUiRequests.delete(response.id);
   }
 
   private getExtensionStatuses(): Array<{ key: string; text: string }> {
@@ -1051,18 +1007,7 @@ export class AgentSessionWrapper {
           title,
         } as ExtensionUiRequest as AgentEvent);
       },
-      // AskUserQuestion bridge intercepts the extension's ask_user_question prompt
-      // before generic custom-UI rendering; every other custom() caller falls through
-      // to upstream's ANSI custom-UI panel (requestExtensionCustomUi).
-      custom: async <T = unknown>(factory: unknown, options?: unknown) => {
-        // Bridge returns a Promise only when it has a stashed ask_user_question prompt;
-        // undefined means "not mine" -> fall through to ANSI custom-UI panel rendering.
-        // Check the Promise (not the awaited value) so a legitimate-but-empty result
-        // is still treated as handled and never routed to the generic panel.
-        const pending = this.askUserQuestionBridge?.tryHandleCustom<T>();
-        if (pending) return pending;
-        return this.requestExtensionCustomUi<T>(factory, options);
-      },
+      custom: <T = unknown>(factory: unknown, options?: unknown) => this.requestExtensionCustomUi<T>(factory, options),
       pasteToEditor: (text) => {
         this.emit({
           type: "extension_ui_request",
@@ -1288,11 +1233,6 @@ export async function startRpcSession(
     initTheme();
     const agentDir = getAgentDir();
 
-    // [ask-u*******************[REDACTED:OpenAI/Anthropic API Key]] share one EventBus with the SDK so we can observe the
-    // extension's ASK_USER_PROMPT_EVENT before it calls ctx.ui.custom(). Inject it via
-    // resourceLoaderOptions.eventBus (the SDK wires pi.events to the resource loader's
-    // bus); the same bus is handed to AgentSessionWrapper below for the bridge to subscribe.
-    const askUserQuestionEventBus = createAskUserQuestionEventBus();
     // Determine which tools to pass based on requested toolNames.
     // Since v0.68.0, session creation expects string[] tool names instead of Tool[] instances.
     let toolsOption: string[] | undefined;
@@ -1316,7 +1256,6 @@ export async function startRpcSession(
       cwd: sessionCwd,
       agentDir,
       ...(trustReloadOptions ? { resourceLoaderReloadOptions: trustReloadOptions } : {}),
-      ...(askUserQuestionEventBus ? { resourceLoaderOptions: { eventBus: askUserQuestionEventBus } } : {}),
     });
     const scope = await resolveVisibleModels(
       services.modelRuntime,
@@ -1366,14 +1305,13 @@ export async function startRpcSession(
       inner.setActiveToolsByName(withExtensionTools(inner, toolNames));
     }
 
-    const wrapper = new AgentSessionWrapper(inner, askUserQuestionEventBus ?? undefined);
+    const wrapper = new AgentSessionWrapper(inner);
     // When all tools are disabled, clear the system prompt entirely.
     // pi's buildSystemPrompt always produces a non-empty prompt even with no tools;
     // keep this forced after extension resource discovery and reloads as well.
     if (toolNames?.length === 0) {
       wrapper.setForceEmptySystemPrompt(true);
     }
-
     wrapper.start();
 
     const realSessionId = inner.sessionId as string;

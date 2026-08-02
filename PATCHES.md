@@ -18,13 +18,6 @@ Baseline: merged upstream `main` at v0.8.6 (SDK 0.83.0) on 2026-08-01. Two patch
 - Upstream: not upstream. Upstream pins `allowedDevOrigins` to `['192.168.*.*']` only and documents plain `npm run dev`.
 - Disable: delete `.dev-origins.json` (the config falls back to LAN only).
 
-## feat: ask-user-question web bridge
-- Purpose: route the `ask_user_question` extension tool's `ctx.ui.custom()` prompt to a web dialog instead of the generic ANSI custom-UI panel. Subscribes to the extension's `ASK_USER_PROMPT_EVENT` on a shared `EventBus` injected into `createAgentSessionServices` via `resourceLoaderOptions.eventBus` (the SDK wires `pi.events` to the resource loader's bus), then hands the same bus to `AgentSessionWrapper`. `custom()` tries the bridge first ("not mine" falls through to upstream's ANSI panel). Pending UI requests are cached and replayed to reconnecting SSE clients and re-surfaced via `get_state`, so a page refresh re-shows an unanswered dialog bound to the original id.
-- Files: `lib/ask-user-question/{index,protocol,server}.ts`, `components/ask-user-question/AskUserQuestionDialog.tsx`, `lib/rpc-manager.ts`, `lib/types.ts`, `hooks/useAgentSession.ts`, `components/ChatWindow.tsx`.
-- Upstream: not upstream. Upstream has generic `createHeadlessCustomUiTui` rendering for `ctx.ui.custom()` (terminal), not a web bridge for `ask_user_question`.
-- Disable: `PIWEB_DISABLE_ASK_USER_QUESTION_BRIDGE=1` (the bridge stays inert; the SDK uses its own internal EventBus).
-- Merge note: re-grafted onto upstream's v0.8.6 `startRpcSession` (services-first) as `resourceLoaderOptions: { eventBus }`, alongside upstream's `resourceLoaderReloadOptions` (project-trust gating, #236). In untrusted project cwds the ask-user extension may not load at all — that is upstream's project-trust behavior, not a bridge regression.
-
 ## ~~feat: scope visible models to enabledModels~~ — SUPERSEDED by upstream (v0.8.6)
 - What it did: filter the model list to the user's `enabledModels` in `GET /api/models` and resolve the new-session default within the scoped set so the SDK's `findInitialModel` didn't fall through to `openrouter/moonshotai/kimi-k2.6`; also removed the `enabledProviders` provider whitelist that blocked providers like `opencode-go`.
 - Why dropped: upstream adopted the same idea in richer form — `lib/model-scope.ts` now delegates to the SDK's own `resolveModelScopeWithDiagnostics()` (minimatch globs, fuzzy patterns, `:thinkingLevel` pins, `modelScopeWarnings`), and `startRpcSession`/`GET /api/models`/`app/api/agent/new` share `resolveVisibleModels` + `selectInitialModelScope`. Upstream's `app/api/models` also surfaces `thinkingLevelPins` to the selector.
