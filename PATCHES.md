@@ -4,7 +4,7 @@ This repo is a fork of [agegr/pi-web](https://github.com/agegr/pi-web). The comm
 
 Patches are ordered oldest-first (the order they apply on top of upstream). Drop a patch by reverting its commit; cross-patch dependencies are noted inline.
 
-Baseline: merged upstream `main` at v0.8.6 (SDK 0.83.0) on 2026-08-01. Two patches were superseded by that merge — they are marked below and their commits remain only as history.
+Baseline: merged upstream `main` at v0.8.7 (SDK 0.84.0) on 2026-08-08. Two patches were superseded by the v0.8.6 merge — they are marked below and their commits remain only as history. No patches were superseded by the v0.8.7 merge.
 
 ## chore: ignore .pi/ local agent data
 - Purpose: ignore the pi coding agent's local runtime dir (sessions, hindsight, taskflows) so per-machine agent state isn't committed.
