@@ -1,0 +1,9 @@
+# The Dockerfile clones the upstream tarball at build time and does not COPY any
+# of these — this just keeps the build context tiny so a stale .appdata or a
+# secrets file is never sent to the daemon.
+.appdata/
+secrets
+*.md
+scripts/
+.gitignore
+.dockerignore

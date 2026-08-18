@@ -1,0 +1,12 @@
+# Appdata: in-repo bind-mount target for the spotify-mcp container (RH-ADR-0003/
+# 0014). Holds the Spotify config (a secret + mutable runtime state rewritten on
+# token refresh) — never track.
+.appdata/
+
+# The config file itself, if one lands here during laptop OAuth (see
+# spotify-mcp/README.md §Prerequisites) — it contains clientId/secret + tokens.
+spotify-config.json
+
+# Editor / OS noise.
+*.log
+.DS_Store
