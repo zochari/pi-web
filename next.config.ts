@@ -56,8 +56,13 @@ const nextConfig: NextConfig = {
   env: {
     NEXT_PUBLIC_APP_VERSION: version,
     NEXT_PUBLIC_PI_VERSION: piVersion,
-
+    // The tailnet FQDN must be inlined at build (Next substitutes config `env`
+    // values into the proxy bundle at build time; the runtime process env is
+    // not visible to the proxy code path in Next 16, confirmed empirically).
+    PI_WEB_HOSTNAME: process.env.PI_WEB_HOSTNAME,
+    PI_WEB_ALLOWED_HOSTS: process.env.PI_WEB_ALLOWED_HOSTS,
   },
+
 };
 
 export default nextConfig;
