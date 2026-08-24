@@ -4,7 +4,7 @@ This repo is a fork of [agegr/pi-web](https://github.com/agegr/pi-web). The comm
 
 Patches are ordered oldest-first (the order they apply on top of upstream). Drop a patch by reverting its commit; cross-patch dependencies are noted inline.
 
-Baseline: merged upstream `main` at v0.8.9 (SDK 0.84.2) on 2026-08-25. Dropped at this merge: the `PI_WEB_HOSTNAME`/`PI_WEB_ALLOWED_HOSTS` inlining in `next.config.ts` (upstream's `lib/request-security.ts` reads both env vars at runtime in the Edge middleware, so build-time inlining is obsolete — the deploy justfile no longer needs its post-pull sed); and the `THINKING_LEVEL_SUFFIXES` dead-code removal, superseded by upstream's own model-scope refactor. Two prior patches were superseded by the v0.8.6 merge — they are marked below and their commits remain only as history.
+Baseline: merged upstream `main` at v0.8.9 (SDK 0.84.2) on 2026-08-25. The `PI_WEB_HOSTNAME`/`PI_WEB_ALLOWED_HOSTS` inlining in `next.config.ts` is now load-bearing: the proxy (`proxy.ts`) checks allowed hostnames, and under Next 16 the proxy code path cannot read `process.env` at runtime — the FQDN must be inlined at build (verified empirically; the runtime read in `lib/request-security.ts` alone 403s the tailnet URL). The deploy justfile re-applies the build-time env, no post-pull sed needed. Dropped at this merge: the `THINKING_LEVEL_SUFFIXES` dead-code removal, superseded by upstream's own model-scope refactor. Two prior patches were superseded by the v0.8.6 merge — they are marked below and their commits remain only as history.
 
 ## chore: ignore .pi/ local agent data
 - Purpose: ignore the pi coding agent's local runtime dir (sessions, hindsight, taskflows) so per-machine agent state isn't committed.
