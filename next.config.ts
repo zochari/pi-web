@@ -1,11 +1,13 @@
 import type { NextConfig } from "next";
 import { readFileSync } from "fs";
-import { join } from "path";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 
-const { version } = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8")) as { version: string };
+const configDir = dirname(fileURLToPath(import.meta.url));
+const { version } = JSON.parse(readFileSync(join(configDir, "package.json"), "utf8")) as { version: string };
 let piVersion = "unknown";
 try {
-  const piPkgPath = join(__dirname, "node_modules/@earendil-works/pi-coding-agent/package.json");
+  const piPkgPath = join(configDir, "node_modules/@earendil-works/pi-coding-agent/package.json");
   piVersion = (JSON.parse(readFileSync(piPkgPath, "utf8")) as { version: string }).version;
 } catch { /* package not found, use default */ }
 
@@ -13,11 +15,12 @@ try {
 // internal hostnames/subnets aren't committed. Falls back to LAN only.
 let extraDevOrigins: string[] = [];
 try {
-  const parsed = JSON.parse(readFileSync(join(__dirname, ".dev-origins.json"), "utf8"));
+  const parsed = JSON.parse(readFileSync(join(configDir, ".dev-origins.json"), "utf8"));
   if (Array.isArray(parsed)) extraDevOrigins = parsed as string[];
 } catch { /* no local overrides */ }
 
 const nextConfig: NextConfig = {
+  outputFileTracingRoot: configDir,
   serverExternalPackages: [
     "undici",
     "@earendil-works/pi-coding-agent",
@@ -25,7 +28,8 @@ const nextConfig: NextConfig = {
     "@earendil-works/pi-ai",
     "@earendil-works/pi-tui",
   ],
-  allowedDevOrigins: ['192.168.*.*', ...extraDevOrigins],
+  allowedDevOrigins: ["127.0.0.1", "192.168.*.*", ...extraDevOrigins],
+
   async headers() {
     return [
       {
@@ -52,8 +56,7 @@ const nextConfig: NextConfig = {
   env: {
     NEXT_PUBLIC_APP_VERSION: version,
     NEXT_PUBLIC_PI_VERSION: piVersion,
-    PI_WEB_HOSTNAME: process.env.PI_WEB_HOSTNAME,
-    PI_WEB_ALLOWED_HOSTS: process.env.PI_WEB_ALLOWED_HOSTS,
+
   },
 };
 

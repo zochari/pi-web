@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { createAgentSessionFromServices, createAgentSessionServices, getAgentDir, initTheme, SessionManager, Theme } from "@earendil-works/pi-coding-agent";
+import { createAgentSessionFromServices, createAgentSessionServices, getAgentDir, initTheme, SessionManager, SettingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager as TuiKeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, realpathSync, writeFileSync } from "fs";
@@ -7,12 +7,23 @@ import { join, resolve } from "path";
 import { validateAgentImages } from "./image-attachments";
 import { invalidateModelsCache } from "./models-cache";
 import { resolveVisibleModels, selectInitialModelScope } from "./model-scope";
+import {
+  createProjectCommandBashExtension,
+  createProjectCommandBashOperations,
+  preferUserBashExtension,
+} from "./project-command-env";
 import { cacheSessionPath, invalidateSessionListCache } from "./session-reader";
 import { getProjectTrustStatus, projectTrustReloadOptions } from "./project-trust";
 import { persistExplicitStartupPreferences } from "./startup-preferences";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./pi-types";
-import type { ExtensionUiRequest, ExtensionUiResponse, ExtensionWidgetItem } from "./types";
+import type {
+  ExtensionUiRequest,
+  ExtensionUiResponse,
+  ExtensionWidgetItem,
+  SessionInfo,
+  SessionMessageEntry,
+} from "./types";
 import { createHeadlessCustomUiTui, DEFAULT_CUSTOM_UI_COLUMNS, type HeadlessCustomUiTui } from "./custom-ui-terminal";
 
 // ============================================================================
@@ -109,7 +120,7 @@ const CODING_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"
 class PlainTextTheme extends Theme {
   constructor() {
     super(
-      { thinkingXhigh: "" } as ConstructorParameters<typeof Theme>[0],
+      { thinkingXhigh: "", searchMatchText: "" } as ConstructorParameters<typeof Theme>[0],
       { selectedBg: "" } as ConstructorParameters<typeof Theme>[1],
       "truecolor",
     );
@@ -200,7 +211,8 @@ export class AgentSessionWrapper {
   private activeExtensionWidgets = new Map<string, ActiveExtensionWidget>();
   private extensionWidgetGenerations = new Map<string, number>();
   private extensionWidgetsResetting = false;
-  private promptRunning = false;
+  private pendingPromptCount = 0;
+  private promptAdmissionTail: Promise<void> = Promise.resolve();
   private extensionsBound = false;
   private extensionBindingPromise: Promise<void> | null = null;
   private extensionBindingError: unknown = null;
@@ -225,12 +237,20 @@ export class AgentSessionWrapper {
     return this.inner.sessionManager.getCwd();
   }
 
+  get streamingMessage() {
+    return this.inner.agent.state?.streamingMessage;
+  }
+
+  get isStreaming(): boolean {
+    return this.inner.isStreaming;
+  }
+
   isAlive(): boolean {
     return this._alive;
   }
 
   isRunning(): boolean {
-    return this._alive && (this.promptRunning || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning);
+    return this._alive && (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning);
   }
 
   start(): void {
@@ -327,7 +347,11 @@ export class AgentSessionWrapper {
   }
 
   private shouldWaitForExtensions(type: string): boolean {
-    return type === "prompt" || type === "steer" || type === "follow_up" || type === "get_commands";
+    return type === "prompt"
+      || type === "steer"
+      || type === "follow_up"
+      || type === "get_commands"
+      || type === "get_state";
   }
 
   private async withFinalRunningNotification<T>(operation: () => Promise<T>): Promise<T> {
@@ -346,7 +370,26 @@ export class AgentSessionWrapper {
   }
 
   private emit(event: AgentEvent): void {
-    for (const l of this.listeners) l(event);
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch (error) {
+        console.error(
+          `[pi-web] failed to deliver ${event.type} event:`,
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }
+  }
+
+  private async acquirePromptAdmission(): Promise<() => void> {
+    const previous = this.promptAdmissionTail;
+    let release!: () => void;
+    this.promptAdmissionTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    return release;
   }
 
   private resetIdleTimer(): void {
@@ -407,35 +450,92 @@ export class AgentSessionWrapper {
 
     switch (type) {
       case "prompt": {
-        if (this.inner.isBashRunning) {
-          throw new Error("Cannot send a prompt while a shell command is running");
-        }
-        // Fire and forget — events come via subscribe
-        const promptImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
-        const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
-        this.promptRunning = true;
-        notifyRunningChange();
-        this.inner.prompt(command.message as string, {
-          ...(promptImages?.length ? { images: promptImages } : {}),
-          ...(streamingBehavior ? { streamingBehavior } : {}),
-          source: "rpc",
-        }).then(() => {
-          this.promptRunning = false;
-          this.resetIdleTimer();
-          if (!streamingBehavior) this.emit({ type: "prompt_done" });
-          notifyRunningChange();
-        }).catch((error) => {
-          this.promptRunning = false;
-          this.resetIdleTimer();
-          invalidateSessionListCache();
-          this.emit({
-            type: "prompt_error",
-            errorMessage: error instanceof Error ? error.message : String(error),
+        // Serialize only admission. Once the preceding prompt has either
+        // passed or failed preflight, the SDK can atomically decide whether
+        // this submission starts a run or joins its streaming queue.
+        const releaseAdmission = await this.acquirePromptAdmission();
+        try {
+          if (this.inner.isBashRunning) {
+            throw new Error("Cannot send a prompt while a shell command is running");
+          }
+          const promptImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
+          const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
+          let preflightAccepted = false;
+          let preflightSettled = false;
+          let promptSettled = false;
+          let acceptPreflight!: () => void;
+          let rejectPreflight!: (error: unknown) => void;
+          const preflight = new Promise<void>((resolve, reject) => {
+            acceptPreflight = () => {
+              preflightAccepted = true;
+              if (preflightSettled) return;
+              preflightSettled = true;
+              resolve();
+            };
+            rejectPreflight = (error) => {
+              if (preflightSettled) return;
+              preflightSettled = true;
+              reject(error);
+            };
           });
-          if (!streamingBehavior) this.emit({ type: "prompt_done" });
+          const finishPrompt = () => {
+            if (promptSettled) return;
+            promptSettled = true;
+            this.pendingPromptCount = Math.max(0, this.pendingPromptCount - 1);
+            this.resetIdleTimer();
+            notifyRunningChange();
+          };
+
+          this.pendingPromptCount += 1;
           notifyRunningChange();
-        });
-        return null;
+          let prompt: Promise<void>;
+          try {
+            prompt = this.inner.prompt(command.message as string, {
+              ...(promptImages?.length ? { images: promptImages } : {}),
+              ...(streamingBehavior ? { streamingBehavior } : {}),
+              source: "rpc",
+              // Match pi's RPC contract: acknowledge only after synchronous prompt
+              // validation and extension preflight have accepted the submission.
+              preflightResult: (success) => {
+                if (success) acceptPreflight();
+              },
+            });
+          } catch (error) {
+            finishPrompt();
+            throw error;
+          }
+
+          void prompt.then(() => {
+            // Compatibility fallback if a future SDK resolves without invoking
+            // the internal callback. This waits for the run, but never acks early.
+            acceptPreflight();
+            finishPrompt();
+            if (!streamingBehavior) this.emit({ type: "prompt_done" });
+          }, (error) => {
+            rejectPreflight(error);
+            finishPrompt();
+            invalidateSessionListCache();
+            // A preflight rejection is returned by the POST itself. Only an
+            // unexpected failure after acceptance needs the asynchronous event.
+            if (preflightAccepted) {
+              this.emit({
+                type: "prompt_error",
+                errorMessage: error instanceof Error ? error.message : String(error),
+              });
+              if (!streamingBehavior) this.emit({ type: "prompt_done" });
+            }
+          }).catch((error) => {
+            console.error(
+              "[pi-web] prompt completion handler failed:",
+              error instanceof Error ? error.message : error,
+            );
+          });
+
+          await preflight;
+          return null;
+        } finally {
+          releaseAdmission();
+        }
       }
 
       case "abort":
@@ -449,7 +549,7 @@ export class AgentSessionWrapper {
           sessionId: this.inner.sessionId,
           sessionFile: this.inner.sessionFile ?? "",
           isStreaming: this.inner.isStreaming,
-          isPromptRunning: this.promptRunning,
+          isPromptRunning: this.pendingPromptCount > 0,
           isBashRunning: this.inner.isBashRunning,
           isCompacting: this.inner.isCompacting,
           autoCompactionEnabled: this.inner.autoCompactionEnabled,
@@ -677,13 +777,18 @@ export class AgentSessionWrapper {
       }
 
       case "bash": {
-        if (this.promptRunning || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning) {
+        if (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning) {
           throw new Error("Cannot run a shell command while the session is busy");
         }
         const execution = this.inner.executeBash(
           command.command as string,
           undefined,
-          { excludeFromContext: command.excludeFromContext as boolean | undefined },
+          {
+            excludeFromContext: command.excludeFromContext as boolean | undefined,
+            operations: createProjectCommandBashOperations({
+              shellPath: this.inner.settingsManager.getShellPath(),
+            }),
+          },
         );
         notifyRunningChange();
         try {
@@ -1354,6 +1459,72 @@ export function getRpcSession(sessionId: string): AgentSessionWrapper | undefine
   return getRegistry().get(sessionId);
 }
 
+function runtimeMessageText(entry: SessionMessageEntry): string {
+  if (entry.message.role === "bashExecution") return "";
+  const content = entry.message.content;
+  if (typeof content === "string") return content;
+  return content
+    .map((block) => block.type === "text" ? block.text : "")
+    .filter(Boolean)
+    .join(" ");
+}
+
+function runtimeMessageActivityMs(entry: SessionMessageEntry): number | undefined {
+  if (entry.message.role !== "user" && entry.message.role !== "assistant") return undefined;
+  if (typeof entry.message.timestamp === "number") return entry.message.timestamp;
+  const timestamp = new Date(entry.timestamp).getTime();
+  return Number.isNaN(timestamp) ? undefined : timestamp;
+}
+
+/**
+ * Return live sessions that should be visible in the session list. Pi delays
+ * the first JSONL flush until an assistant message exists, so an accepted new
+ * prompt must temporarily be described from its in-memory SessionManager.
+ */
+export function getRpcSessionInfos(): SessionInfo[] {
+  const sessions: SessionInfo[] = [];
+  for (const session of getRegistry().values()) {
+    if (!session.isAlive()) continue;
+
+    const manager = session.inner.sessionManager;
+    const header = manager.getHeader();
+    const entries = manager.getEntries() as unknown as Array<
+      { type: string; timestamp: string } | SessionMessageEntry
+    >;
+    const messages = entries.filter((entry): entry is SessionMessageEntry => entry.type === "message");
+    const firstUserMessage = messages.find((entry) => entry.message.role === "user");
+    const sessionFile = manager.getSessionFile() ?? session.sessionFile;
+    const persisted = Boolean(sessionFile && existsSync(sessionFile));
+
+    // An ensure_session call creates an idle, empty runtime while the composer
+    // loads commands. Do not leak it into history before a prompt is accepted.
+    if (!persisted && (!session.isRunning() || !firstUserMessage)) continue;
+
+    const created = header?.timestamp
+      ?? entries[0]?.timestamp
+      ?? new Date().toISOString();
+    const headerTimestamp = new Date(created).getTime();
+    let lastActivityMs = Number.isNaN(headerTimestamp) ? Date.now() : headerTimestamp;
+    for (const message of messages) {
+      const activityMs = runtimeMessageActivityMs(message);
+      if (activityMs !== undefined) lastActivityMs = Math.max(lastActivityMs, activityMs);
+    }
+
+    sessions.push({
+      path: sessionFile ?? "",
+      id: header?.id ?? session.sessionId,
+      cwd: header?.cwd ?? session.cwd,
+      name: manager.getSessionName(),
+      created,
+      modified: new Date(lastActivityMs).toISOString(),
+      messageCount: messages.length,
+      firstMessage: firstUserMessage ? runtimeMessageText(firstUserMessage) || "(no messages)" : "(no messages)",
+      transient: !persisted,
+    });
+  }
+  return sessions;
+}
+
 export function hasBusyRpcSessionForCwd(cwd: string): boolean {
   const targetCwd = normalizeRpcCwd(cwd);
   if (getStartingSessionCwds().has(targetCwd)) return true;
@@ -1480,9 +1651,20 @@ export async function startRpcSession(
     // Gate untrusted project extensions so opening a repository does not run
     // its .pi/extensions code automatically (see lib/project-trust.ts, #236).
     const trustReloadOptions = projectTrustReloadOptions(sessionCwd, agentDir);
+    const settingsManager = SettingsManager.create(sessionCwd, agentDir);
     const services = await createAgentSessionServices({
       cwd: sessionCwd,
       agentDir,
+      settingsManager,
+      resourceLoaderOptions: {
+        extensionFactories: [
+          createProjectCommandBashExtension({
+            cwd: sessionCwd,
+            settings: settingsManager,
+          }),
+        ],
+        extensionsOverride: preferUserBashExtension,
+      },
       ...(trustReloadOptions ? { resourceLoaderReloadOptions: trustReloadOptions } : {}),
     });
     const scope = await resolveVisibleModels(
