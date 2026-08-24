@@ -4,7 +4,7 @@ This repo is a fork of [agegr/pi-web](https://github.com/agegr/pi-web). The comm
 
 Patches are ordered oldest-first (the order they apply on top of upstream). Drop a patch by reverting its commit; cross-patch dependencies are noted inline.
 
-Baseline: merged upstream `main` at v0.8.7 (SDK 0.84.0) on 2026-08-08. Two patches were superseded by the v0.8.6 merge — they are marked below and their commits remain only as history. No patches were superseded by the v0.8.7 merge.
+Baseline: merged upstream `main` at v0.8.9 (SDK 0.84.2) on 2026-08-25. Dropped at this merge: the `PI_WEB_HOSTNAME`/`PI_WEB_ALLOWED_HOSTS` inlining in `next.config.ts` (upstream's `lib/request-security.ts` reads both env vars at runtime in the Edge middleware, so build-time inlining is obsolete — the deploy justfile no longer needs its post-pull sed); and the `THINKING_LEVEL_SUFFIXES` dead-code removal, superseded by upstream's own model-scope refactor. Two prior patches were superseded by the v0.8.6 merge — they are marked below and their commits remain only as history.
 
 ## chore: ignore .pi/ local agent data
 - Purpose: ignore the pi coding agent's local runtime dir (sessions, hindsight, taskflows) so per-machine agent state isn't committed.
@@ -13,9 +13,9 @@ Baseline: merged upstream `main` at v0.8.7 (SDK 0.84.0) on 2026-08-08. Two patch
 - Disable: remove the `.pi/` line.
 
 ## chore: local dev environment — pm2 workflow + dev-origin overrides
-- Purpose: document the canonical pm2 dev mode (hot-reload via Next Fast Refresh, restart-on-crash; pm2 `watch` stays off); allow per-host `allowedDevOrigins` overrides via a gitignored `.dev-origins.json` so internal hostnames/subnets aren't committed.
+- Purpose: document the canonical pm2 dev mode (hot-reload via Next Fast Refresh, restart-on-crash; pm2 `watch` stays off); allow per-host `allowedDevOrigins` overrides via a gitignored `.dev-origins.json` (read through Next ESM `configDir`) so internal hostnames/subnets aren't committed.
 - Files: `AGENTS.md`, `next.config.ts`, `.gitignore`.
-- Upstream: not upstream. Upstream pins `allowedDevOrigins` to `['192.168.*.*']` only and documents plain `npm run dev`.
+- Upstream: not upstream. Upstream pins `allowedDevOrigins` to `['127.0.0.1', '192.168.*.*']` and documents plain `npm run dev`.
 - Disable: delete `.dev-origins.json` (the config falls back to LAN only).
 
 ## ~~feat: scope visible models to enabledModels~~ — SUPERSEDED by upstream (v0.8.6)
