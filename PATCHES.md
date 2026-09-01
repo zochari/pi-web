@@ -4,7 +4,7 @@ This repo is a fork of [agegr/pi-web](https://github.com/agegr/pi-web). The comm
 
 Patches are ordered oldest-first (the order they apply on top of upstream). Drop a patch by reverting its commit; cross-patch dependencies are noted inline.
 
-Baseline: merged upstream `main` at v0.8.9 (SDK 0.84.2) on 2026-08-25. The `PI_WEB_HOSTNAME`/`PI_WEB_ALLOWED_HOSTS` inlining in `next.config.ts` is now load-bearing: the proxy (`proxy.ts`) checks allowed hostnames, and under Next 16 the proxy code path cannot read `process.env` at runtime — the FQDN must be inlined at build (verified empirically; the runtime read in `lib/request-security.ts` alone 403s the tailnet URL). The deploy justfile re-applies the build-time env, no post-pull sed needed. Dropped at this merge: the `THINKING_LEVEL_SUFFIXES` dead-code removal, superseded by upstream's own model-scope refactor. Two prior patches were superseded by the v0.8.6 merge — they are marked below and their commits remain only as history.
+Baseline: merged upstream `main` at v0.8.11 (SDK 0.84.3) on 2026-09-01. The `PI_WEB_HOSTNAME`/`PI_WEB_ALLOWED_HOSTS` inlining in `next.config.ts` is load-bearing: the proxy (`proxy.ts`) checks allowed hostnames, and under Next 16 the proxy code path cannot read `process.env` at runtime — the FQDN must be inlined at build (verified empirically; the runtime read in `lib/request-security.ts` alone 403s the tailnet URL). The deploy justfile re-applies the build-time env, no post-pull sed needed. No patches dropped at this merge; all active patches carried over. Upstream v0.8.10 expanded its own `allowedDevOrigins` to loopback + the full RFC1918 ranges, absorbing the LAN half of the dev-origins patch, and reworked `lib/request-security.ts` same-origin handling for scheme-rewriting proxies (`x-forwarded-proto`) — the same area the inlining serves, so the tailscale sidecar URL must be re-verified after any deploy touching it. Dropped at the v0.8.9 merge: the `THINKING_LEVEL_SUFFIXES` dead-code removal, superseded by upstream's own model-scope refactor. Two prior patches were superseded by the v0.8.6 merge — they are marked below and their commits remain only as history.
 
 ## chore: ignore .pi/ local agent data
 - Purpose: ignore the pi coding agent's local runtime dir (sessions, hindsight, taskflows) so per-machine agent state isn't committed.
@@ -15,7 +15,7 @@ Baseline: merged upstream `main` at v0.8.9 (SDK 0.84.2) on 2026-08-25. The `PI_W
 ## chore: local dev environment — pm2 workflow + dev-origin overrides
 - Purpose: document the canonical pm2 dev mode (hot-reload via Next Fast Refresh, restart-on-crash; pm2 `watch` stays off); allow per-host `allowedDevOrigins` overrides via a gitignored `.dev-origins.json` (read through Next ESM `configDir`) so internal hostnames/subnets aren't committed.
 - Files: `AGENTS.md`, `next.config.ts`, `.gitignore`.
-- Upstream: not upstream. Upstream pins `allowedDevOrigins` to `['127.0.0.1', '192.168.*.*']` and documents plain `npm run dev`.
+- Upstream: partially (as of v0.8.10). Upstream pins `allowedDevOrigins` to loopback + the full RFC1918 ranges (10.x, 172.16-31.x, 192.168.x) and documents plain `npm run dev`; the gitignored `.dev-origins.json` override mechanism itself is not upstream, and the fork spreads `...extraDevOrigins` onto upstream's expanded list.
 - Disable: delete `.dev-origins.json` (the config falls back to LAN only).
 
 ## ~~feat: scope visible models to enabledModels~~ — SUPERSEDED by upstream (v0.8.6)
