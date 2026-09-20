@@ -4,7 +4,11 @@ This repo is a fork of [agegr/pi-web](https://github.com/agegr/pi-web). The comm
 
 Patches are ordered oldest-first (the order they apply on top of upstream). Drop a patch by reverting its commit; cross-patch dependencies are noted inline.
 
-Baseline: merged upstream `main` at v0.8.11 (SDK 0.84.3) on 2026-09-01. The `PI_WEB_HOSTNAME`/`PI_WEB_ALLOWED_HOSTS` inlining in `next.config.ts` is load-bearing: the proxy (`proxy.ts`) checks allowed hostnames, and under Next 16 the proxy code path cannot read `process.env` at runtime — the FQDN must be inlined at build (verified empirically; the runtime read in `lib/request-security.ts` alone 403s the tailnet URL). The deploy justfile re-applies the build-time env, no post-pull sed needed. No patches dropped at this merge; all active patches carried over. Upstream v0.8.10 expanded its own `allowedDevOrigins` to loopback + the full RFC1918 ranges, absorbing the LAN half of the dev-origins patch, and reworked `lib/request-security.ts` same-origin handling for scheme-rewriting proxies (`x-forwarded-proto`) — the same area the inlining serves, so the tailscale sidecar URL must be re-verified after any deploy touching it. Dropped at the v0.8.9 merge: the `THINKING_LEVEL_SUFFIXES` dead-code removal, superseded by upstream's own model-scope refactor. Two prior patches were superseded by the v0.8.6 merge — they are marked below and their commits remain only as history.
+Baseline: merged upstream `main` at v0.9.1+ (upstream commit `1eb5e66`, SDK/pi packages 0.85.1, Next 16.3.5) on 2026-09-18. The merge was conflict-free; no patch needed code changes and none were dropped. Verified after the merge: `tsc --noEmit` clean, `eslint .` clean, `npm test` 1121/1121 pass. One caveat about the test suite: `lib/project-trust.test.mjs` fails on a machine that has `/tmp/.pi` or `/tmp/.agents`, because the SDK's `hasTrustRequiringProjectResources()` walks up from the fixture dir and finds them, so the "clean project" fixture is reported as trust-requiring. Run tests with a private `TMPDIR` on such a host; it is not a fork regression.
+
+The `PI_WEB_HOSTNAME`/`PI_WEB_ALLOWED_HOSTS` inlining in `next.config.ts` is load-bearing: the proxy (`proxy.ts`) checks allowed hostnames, and under Next 16 the proxy code path cannot read `process.env` at runtime — the FQDN must be inlined at build (verified empirically; the runtime read in `lib/request-security.ts` alone 403s the tailnet URL). The deploy justfile re-applies the build-time env, no post-pull sed needed. Upstream v0.9.x added browser password login (`e685cac`), and `proxy.ts` now also reads `PI_WEB_PASSWORD` through `lib/web-auth.ts`. If that feature is ever switched on for the tailnet deploy, the same inlining rule applies to `PI_WEB_PASSWORD`, so add it to the `env` block rather than relying on the runtime process env. Upstream also raised `experimental.proxyClientMaxBodySize` to 128mb and set `images.unoptimized`, both in the same config object the patch edits.
+
+Prior-merge history: upstream v0.8.10 expanded its own `allowedDevOrigins` to loopback + the full RFC1918 ranges, absorbing the LAN half of the dev-origins patch, and reworked `lib/request-security.ts` same-origin handling for scheme-rewriting proxies (`x-forwarded-proto`) — the same area the inlining serves, so the tailscale sidecar URL must be re-verified after any deploy touching it. Dropped at the v0.8.9 merge: the `THINKING_LEVEL_SUFFIXES` dead-code removal, superseded by upstream's own model-scope refactor. Two prior patches were superseded by the v0.8.6 merge — they are marked below and their commits remain only as history.
 
 ## chore: ignore .pi/ local agent data
 - Purpose: ignore the pi coding agent's local runtime dir (sessions, hindsight, taskflows) so per-machine agent state isn't committed.
@@ -31,11 +35,17 @@ Baseline: merged upstream `main` at v0.8.11 (SDK 0.84.3) on 2026-09-01. The `PI_
 ## fix: spawn real pi CLI for subagents (PI_SUBAGENT_PI_COMMAND)
 - Purpose: the `pi-subagents` extension (edxeth/pi-subagents) treats `process.argv[1]` (the Next.js server script) as the pi binary and re-launches Next.js with pi's flags, so every subagent fails fast. `ensureSubagentPiCommand` sets `PI_SUBAGENT_PI_COMMAND` to the installed `pi-coding-agent` CLI before creating a session; an explicit env value always takes precedence, and the child env is spread from `process.env` so nested pi children inherit it too.
 - Files: `lib/rpc-manager.ts`.
-- Upstream: not upstream.
+- Upstream: not upstream. Still needed as of the v0.9.1+ merge: upstream ships its own built-in subagents (`lib/subagents.ts`, `lib/subagent-extension.ts`), but `builtInEnabled` defaults to `false` when `~/.pi/agent/agents/settings.json` is absent, and this machine's global pi settings still load the external `pi-subagents` extension. The patch also still resolves against SDK 0.85.1, whose `getPackageDir()` export and `dist/cli.js` both exist. Revisit only if the built-in switch is turned on and the external extension is dropped from pi settings.
 - Disable: set `PI_SUBAGENT_PI_COMMAND` explicitly in the environment (the function no-ops when it's already set).
 
 ## feat: render rpiv-todo tool calls as a checklist
 - Purpose: render the `rpiv-todo` tool's calls as a compact, expandable Todo block (status glyphs, task ids, active-form annotations, blocked-by chains) with a one-line action/result header, instead of the generic tool-call block.
 - Files: `components/MessageView.tsx`.
-- Upstream: not upstream.
+- Upstream: not upstream. Known divergence after the v0.9.1+ merge: `TodoToolBlock` short-circuits `ToolCallBlock`, so it keeps local `useState` expansion and does not use upstream's persisted expansion store (`lib/tool-call-expansion.ts`). A todo card therefore always starts expanded and forgets its open/closed state across reloads. Harmless today; wire it through `isToolCallExpanded`/`setToolCallExpanded` if that becomes annoying.
 - Disable: revert; non-todo tools are unaffected (the Todo block only matches `toolName === "todo"`).
+
+## feat: spotify-mcp sidecar service (ADR-0016)
+- Purpose: a self-hosted Spotify MCP sidecar that ships with this fork: container build, config delivery script, and the encrypted secrets blob. It runs beside Pi Web and does not change any Pi Web code path.
+- Files: `spotify-mcp/**`, `docs/adr/0016-spotify-mcp-service.md`.
+- Upstream: not upstream, and never will be (local infrastructure).
+- Disable: delete the `spotify-mcp/` directory; nothing in `app/`, `lib/`, or `components/` imports it.
