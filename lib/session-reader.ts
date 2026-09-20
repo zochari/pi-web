@@ -1,19 +1,19 @@
 import {
   SessionManager,
-  buildContextEntries as piBuildContextEntries,
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import { closeSync, type Dirent, fstatSync, openSync, readSync } from "fs";
 import { readdir } from "fs/promises";
 import { isAbsolute, join, normalize as normalizePath, relative, resolve as resolvePath, sep } from "path";
 import type { AgentMessage, ImageContent, SessionEntry, SessionHeader, SessionInfo, SessionContext } from "./types";
-import type { SessionEntry as PiSessionEntry, SessionInfo as PiSessionInfo } from "@earendil-works/pi-coding-agent";
 import { normalizeToolCalls } from "./normalize";
+import { getThinkingPreview } from "./message-display";
 import { projectIdentityKey } from "./project-identity";
 import { sessionPathKey } from "./session-path";
 import { MAX_TOOL_RESULT_IMAGE_BYTES, TOOL_RESULT_IMAGE_MIMES } from "./tool-result-images";
 import { resolveProject, type ProjectInfo } from "./worktree";
 import { readSubagentRun, SUBAGENT_META_TYPE } from "./subagents";
+import { listSessionsIncremental } from "./session-list-scanner";
 
 export { getAgentDir };
 
@@ -21,6 +21,8 @@ const SESSION_HEADER_MAX_BYTES = 64 * 1024;
 const SESSION_RELATION_MAX_BYTES = 256 * 1024;
 const SESSION_RELATION_MAX_LINES = 2;
 const SESSION_RESULT_MAX_BYTES = 256 * 1024;
+// Bounded probe for the newest entry id; never reads a whole session file.
+const SESSION_TAIL_PROBE_MAX_BYTES = 64 * 1024;
 
 function readBoundedLines(filePath: string, maxBytes: number, maxLines: number): string[] {
   const fd = openSync(filePath, "r");
@@ -94,6 +96,47 @@ function parseSessionEntries(lines: readonly string[]): SessionEntry[] {
   });
 }
 
+/**
+ * Entry id carried by one serialized JSONL line, or undefined when the line is
+ * the session header, malformed, or a torn trailing write mid-append.
+ *
+ * The header carries the session id rather than an entry id, and the SDK's entry
+ * index excludes it — treating it as an entry would evict a fresh wrapper.
+ */
+function readEntryId(line: string): string | undefined {
+  try {
+    const entry = JSON.parse(line) as { type?: unknown; id?: unknown };
+    if (entry.type === "session") return undefined;
+    return typeof entry.id === "string" && entry.id ? entry.id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Newest entry id recorded on disk, read from a bounded tail so large sessions
+ * stay cheap. Undefined when the file is absent (a wrapper that has not flushed
+ * its first assistant turn yet) or unreadable.
+ *
+ * Used only on ?force=1 session reads (mount / page refresh). An id the
+ * in-memory wrapper never saw means another pi process appended to the file.
+ */
+export function readLatestSessionEntryId(filePath: string | undefined): string | undefined {
+  if (!filePath) return undefined;
+  let lines: string[];
+  try {
+    lines = readBoundedTailLines(filePath, SESSION_TAIL_PROBE_MAX_BYTES);
+  } catch {
+    return undefined;
+  }
+  // Walk backwards so a torn trailing line falls back to the previous entry.
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const entryId = readEntryId(lines[index]);
+    if (entryId) return entryId;
+  }
+  return undefined;
+}
+
 function readSessionRelationEntries(filePath: string): SessionEntry[] {
   const prefixEntries = parseSessionEntries(
     readBoundedLines(filePath, SESSION_RELATION_MAX_BYTES, SESSION_RELATION_MAX_LINES).slice(1),
@@ -141,11 +184,11 @@ export function mergeSessionLists(
 }
 
 async function loadAllSessions(): Promise<SessionInfo[]> {
-  const piSessions: PiSessionInfo[] = await SessionManager.listAll();
+  const scanned = await listSessionsIncremental();
   const pathToId = new Map<string, string>();
-  for (const s of piSessions) pathToId.set(sessionPathKey(s.path), s.id);
+  for (const s of scanned) pathToId.set(sessionPathKey(s.path), s.id);
 
-  const sessions = piSessions.map((s) => {
+  const sessions = scanned.map((s) => {
     cacheSessionPath(s.id, s.path);
     const originSessionId = s.parentSessionPath ? pathToId.get(sessionPathKey(s.parentSessionPath)) : undefined;
     let subagent = null;
@@ -159,8 +202,8 @@ async function loadAllSessions(): Promise<SessionInfo[]> {
       id: s.id,
       cwd: s.cwd,
       name: s.name,
-      created: s.created instanceof Date ? s.created.toISOString() : String(s.created),
-      modified: s.modified instanceof Date ? s.modified.toISOString() : String(s.modified),
+      created: s.created.toISOString(),
+      modified: s.modified.toISOString(),
       messageCount: s.messageCount,
       firstMessage: s.firstMessage || "(no messages)",
       parentSessionId: originSessionId,
@@ -317,6 +360,10 @@ export function invalidateSessionListCache(): void {
   globalThis.__piSessionListCache = undefined;
 }
 
+export function getSessionListVersion(): number {
+  return globalThis.__piSessionListGeneration ?? 0;
+}
+
 function getPathCache(): Map<string, string> {
   if (!globalThis.__piSessionPathCache) globalThis.__piSessionPathCache = new Map();
   return globalThis.__piSessionPathCache;
@@ -406,30 +453,39 @@ export function getSessionEntries(filePath: string): SessionEntry[] {
   return entries as unknown as SessionEntry[];
 }
 
+export function getLatestModelChange(entries: SessionEntry[]): SessionContext["model"] {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type === "model_change") {
+      return { provider: entry.provider, modelId: entry.modelId };
+    }
+  }
+  return null;
+}
+
 function getSessionSettings(entries: SessionEntry[], leafId?: string | null): Pick<SessionContext, "thinkingLevel" | "model"> {
   if (leafId === null) return { thinkingLevel: "off", model: null };
-  const byId = new Map(entries.map((entry) => [entry.id, entry]));
-  let current = leafId ? byId.get(leafId) : undefined;
-  current ??= entries[entries.length - 1];
+  const branch = sliceActiveBranch(entries, leafId ?? null, entries.length);
   let thinkingLevel: string | undefined;
-  let model: SessionContext["model"] | undefined;
+  let responseModel: SessionContext["model"] | undefined;
 
-  while (current && (thinkingLevel === undefined || model === undefined)) {
-    if (thinkingLevel === undefined && current.type === "thinking_level_change") {
-      thinkingLevel = current.thinkingLevel;
+  for (let i = branch.length - 1; i >= 0 && (thinkingLevel === undefined || responseModel === undefined); i--) {
+    const entry = branch[i];
+    if (thinkingLevel === undefined && entry.type === "thinking_level_change") {
+      thinkingLevel = entry.thinkingLevel;
     }
-    if (model === undefined && current.type === "model_change") {
-      model = { provider: current.provider, modelId: current.modelId };
-    } else if (model === undefined && current.type === "message" && current.message.role === "assistant") {
-      const message = current.message as { provider?: unknown; model?: unknown };
+    if (responseModel === undefined && entry.type === "message" && entry.message.role === "assistant") {
+      const message = entry.message as { provider?: unknown; model?: unknown };
       if (typeof message.provider === "string" && typeof message.model === "string") {
-        model = { provider: message.provider, modelId: message.model };
+        responseModel = { provider: message.provider, modelId: message.model };
       }
     }
-    current = current.parentId ? byId.get(current.parentId) : undefined;
   }
 
-  return { thinkingLevel: thinkingLevel ?? "off", model: model ?? null };
+  return {
+    thinkingLevel: thinkingLevel ?? "off",
+    model: getLatestModelChange(branch) ?? responseModel ?? null,
+  };
 }
 
 export interface BuildSessionContextOptions {
@@ -447,29 +503,21 @@ export function buildSessionContext(
   options: BuildSessionContextOptions = {},
 ): SessionContext {
   const { tail, excludeLeaf } = options;
-  // Restrict SDK conversion and the response payload to the requested page.
-  const sliced = tail && tail > 0 ? sliceActiveBranch(entries, leafId ?? null, tail, excludeLeaf) : entries;
-  const hasMore = Boolean(tail && tail > 0 && sliced[0]?.parentId);
-  const byId = new Map<string, SessionEntry>();
-  for (const e of sliced) byId.set(e.id, e);
-
-  const piEntries = sliced as unknown as PiSessionEntry[];
-  const contextEntries = piBuildContextEntries(
-    piEntries,
-    leafId,
-    byId as unknown as Map<string, PiSessionEntry>,
+  // History pages retain the original branch order, including compacted messages.
+  // SDK context filtering can drop a page's messages when firstKeptEntryId is outside it.
+  const sliced = leafId === null ? [] : sliceActiveBranch(
+    entries, leafId ?? null, tail && tail > 0 ? tail : entries.length, excludeLeaf,
   );
+  const hasMore = Boolean(tail && tail > 0 && sliced[0]?.parentId);
 
-  // Convert the SDK-selected context entries and their IDs together. This keeps
-  // fork/navigation targets aligned while preserving pi's compaction ordering.
+  // Convert messages and their IDs together to keep fork/navigation targets aligned.
   const messages: AgentMessage[] = [];
   const entryIds: string[] = [];
-  for (const entry of contextEntries) {
-    const localEntry = entry as unknown as SessionEntry;
-    const m = entryToUiMessage(localEntry, options);
+  for (const entry of sliced) {
+    const m = entryToUiMessage(entry, options);
     if (m) {
       messages.push(m);
-      entryIds.push(localEntry.id);
+      entryIds.push(entry.id);
     }
   }
 
@@ -483,11 +531,34 @@ export function buildSessionContext(
 }
 
 /**
+ * Entry that renders as a standalone visible message in the chat window:
+ * user / assistant messages plus the compaction divider. toolResult entries,
+ * hidden custom messages and session meta render as attachments or nothing,
+ * so they must not consume the `tail` budget — counting raw entries starves
+ * user messages out of the window in agent-heavy sessions (a 50-entry window
+ * over a tool-heavy session can hold a single user message).
+ */
+function countsTowardTail(entry: SessionEntry): boolean {
+  if (entry.type === "compaction") return true;
+  if (entry.type !== "message") return false;
+  const role = (entry as { message?: { role?: string } }).message?.role;
+  return role === "user" || role === "assistant";
+}
+
+/**
+ * Raw-entry ceiling for one page, so a span of tool traffic with few visible
+ * anchors cannot balloon the payload. Scaled with `tail`; older history still
+ * pages in via `before`.
+ */
+const MIN_RAW_WINDOW_ENTRIES = 200;
+const rawWindowCap = (tail: number) => Math.max(MIN_RAW_WINDOW_ENTRIES, tail * 6);
+
+/**
  * Extract the ancestor chain from `leafId` back toward the root, capped at
- * `tail` entries (most-recent first after the final reverse). Iterative: a
- * linear session's chain length equals its entry count, so a recursive walk
- * would overflow the stack. The result is still a valid prefix of the active
- * branch — older history is loaded on demand via pagination.
+ * `tail` visible entries (most-recent first after the final reverse).
+ * Iterative: a linear session's chain length equals its entry count, so a
+ * recursive walk would overflow the stack. The result is still a valid prefix
+ * of the active branch — older history is loaded on demand via pagination.
  */
 export function sliceActiveBranch(
   entries: SessionEntry[],
@@ -506,8 +577,12 @@ export function sliceActiveBranch(
   if (!leaf) return [];
   const chain: SessionEntry[] = [];
   let current: SessionEntry | undefined = leaf;
-  while (current && chain.length < tail) {
+  let visible = 0;
+  const rawCap = rawWindowCap(tail);
+  while (current) {
     chain.push(current);
+    if (countsTowardTail(current)) visible++;
+    if (visible >= tail || chain.length >= rawCap) break;
     current = current.parentId ? byId.get(current.parentId) : undefined;
   }
   chain.reverse();
@@ -613,7 +688,7 @@ function entryToUiMessage(
         ...message,
         content: content.map((block) => (
           block.type === "thinking" && block.thinking.trim() !== ""
-            ? { ...block, thinking: "", deferred: true }
+            ? { ...block, thinking: getThinkingPreview(block.thinking), deferred: true }
             : block
         )),
       };

@@ -7,6 +7,7 @@ export interface SubagentProfilesResponse {
 
 export interface SubagentSettingsResponse {
   enabled: boolean;
+  maxConcurrent: number;
 }
 
 export interface ShellToolSettingsResponse {
@@ -108,15 +109,38 @@ export interface PluginResourceInfo {
   relativePath: string;
 }
 
+export interface PluginStandaloneExtensionInfo extends PluginResourceInfo {
+  kind: "extension";
+  scope: PluginScope;
+  enabled: boolean;
+}
+
+export type PluginUpdateState =
+  | "update-available"
+  | "up-to-date"
+  | "unsupported"
+  | "error";
+
+export interface PluginUpdateResult {
+  source: string;
+  scope: PluginScope;
+  displayName: string;
+  type: "npm" | "git";
+  state: PluginUpdateState;
+  message?: string;
+}
+
 export interface PluginPackageInfo {
   source: string;
   scope: PluginScope;
+  canCheckForUpdates: boolean;
   filtered: boolean;
   disabled: boolean;
   installedPath?: string;
   packageName?: string;
   version?: string;
   configuredVersion?: string;
+  description?: string;
   counts: PluginResourceCounts;
   resources: PluginResourceInfo[];
   status: "loaded" | "installed" | "missing" | "disabled";
@@ -124,6 +148,7 @@ export interface PluginPackageInfo {
 
 export interface PluginsResponse {
   packages: PluginPackageInfo[];
+  standaloneExtensions: PluginStandaloneExtensionInfo[];
   totals: PluginResourceCounts;
   diagnostics: PluginDiagnostic[];
   projectResourcesLoaded: boolean;
