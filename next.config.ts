@@ -11,13 +11,6 @@ try {
   piVersion = (JSON.parse(readFileSync(piPkgPath, "utf8")) as { version: string }).version;
 } catch { /* package not found, use default */ }
 
-// Local-only dev origin overrides live in .dev-origins.json (gitignored) so
-// internal hostnames/subnets aren't committed. Falls back to LAN only.
-let extraDevOrigins: string[] = [];
-try {
-  const parsed = JSON.parse(readFileSync(join(configDir, ".dev-origins.json"), "utf8"));
-  if (Array.isArray(parsed)) extraDevOrigins = parsed as string[];
-} catch { /* no local overrides */ }
 
 const nextConfig: NextConfig = {
   outputFileTracingRoot: configDir,
@@ -42,8 +35,7 @@ const nextConfig: NextConfig = {
   ],
   // Next 16 blocks cross-origin access to dev resources by default. Allow the
   // loopback and the RFC1918 LAN ranges so the dev server stays reachable
-  // from other machines on the same LAN. extraDevOrigins appends the local,
-  // gitignored .dev-origins.json overrides (internal hostnames/subnets).
+  // from other machines on the same LAN.
   allowedDevOrigins: [
     "127.0.0.1",
     "10.*.*.*",
@@ -65,7 +57,6 @@ const nextConfig: NextConfig = {
     "172.30.*.*",
     "172.31.*.*",
     "192.168.*.*",
-    ...extraDevOrigins,
   ],
   async headers() {
     return [

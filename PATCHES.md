@@ -8,7 +8,7 @@ Baseline: merged upstream `main` at v0.9.3 (upstream commit `96966e5`, SDK/pi pa
 
 The `PI_WEB_HOSTNAME`/`PI_WEB_ALLOWED_HOSTS` inlining in `next.config.ts` is load-bearing: the proxy (`proxy.ts`) checks allowed hostnames, and under Next 16 the proxy code path cannot read `process.env` at runtime — the FQDN must be inlined at build (verified empirically; the runtime read in `lib/request-security.ts` alone 403s the tailnet URL). The deploy justfile re-applies the build-time env, no post-pull sed needed. Upstream v0.9.0 reworked `proxy.ts` for the new optional browser password login (#505, `e685cac`): with no web password configured the proxy passes straight through, and the host allowlist (`isApiRequestHostAllowed`) still runs before auth, so the no-auth tailnet posture and the inlining both stand. `proxy.ts` now also reads `PI_WEB_PASSWORD` through `lib/web-auth.ts`, so if that feature is ever switched on for the tailnet deploy the same inlining rule applies to it: add it to the `env` block rather than relying on the runtime process env. Upstream also raised `experimental.proxyClientMaxBodySize` to 128mb and set `images.unoptimized`, both in the same config object the patch edits. The sidecar URL still needs re-verification after any deploy touching this area.
 
-Prior-merge history: upstream v0.8.10 expanded its own `allowedDevOrigins` to loopback + the full RFC1918 ranges, absorbing the LAN half of the dev-origins patch, and reworked `lib/request-security.ts` same-origin handling for scheme-rewriting proxies (`x-forwarded-proto`) — the same area the inlining serves, so the tailscale sidecar URL must be re-verified after any deploy touching it. Dropped at the v0.8.9 merge: the `THINKING_LEVEL_SUFFIXES` dead-code removal, superseded by upstream's own model-scope refactor. Two prior patches were superseded by the v0.8.6 merge — they are marked below and their commits remain only as history.
+Prior-merge history: upstream v0.8.10 expanded its own `allowedDevOrigins` to loopback + the full RFC1918 ranges, absorbing the LAN half of the dev-origins patch, and reworked `lib/request-security.ts` same-origin handling for scheme-rewriting proxies (`x-forwarded-proto`) — the same area the inlining serves, so the tailscale sidecar URL must be re-verified after any deploy touching it. Dropped at the v0.8.9 merge: the `THINKING_LEVEL_SUFFIXES` dead-code removal, superseded by upstream's own model-scope refactor. Two prior patches were superseded by the v0.8.6 merge — they are marked below and their commits remain only as history. Dropped at the 2026-09-24 cleanup, after the v0.9.3 merge: the spotify-mcp sidecar patch (never deployed on any box; nothing in `app/`, `lib/`, or `components/` imported it) and the `.dev-origins.json` dev-origin override (the file was never created in any checkout, so upstream's loopback+RFC1918 `allowedDevOrigins` already covered every origin actually used; if dev mode is ever browsed over the tailnet, 100.64.0.0/10 sits outside RFC1918 and an explicit `100.*` entry will be needed again).
 
 ## chore: ignore .pi/ local agent data
 - Purpose: ignore the pi coding agent's local runtime dir (sessions, hindsight, taskflows) so per-machine agent state isn't committed.
@@ -16,11 +16,11 @@ Prior-merge history: upstream v0.8.10 expanded its own `allowedDevOrigins` to lo
 - Upstream: not upstream (upstream `.gitignore` has no `.pi/` entry).
 - Disable: remove the `.pi/` line.
 
-## chore: local dev environment — pm2 workflow + dev-origin overrides
-- Purpose: document the canonical pm2 dev mode (hot-reload via Next Fast Refresh, restart-on-crash; pm2 `watch` stays off); allow per-host `allowedDevOrigins` overrides via a gitignored `.dev-origins.json` (read through Next ESM `configDir`) so internal hostnames/subnets aren't committed.
-- Files: `AGENTS.md`, `next.config.ts`, `.gitignore`.
-- Upstream: partially (as of v0.8.10). Upstream pins `allowedDevOrigins` to loopback + the full RFC1918 ranges (10.x, 172.16-31.x, 192.168.x) and documents plain `npm run dev`; the gitignored `.dev-origins.json` override mechanism itself is not upstream, and the fork spreads `...extraDevOrigins` onto upstream's expanded list.
-- Disable: delete `.dev-origins.json` (the config falls back to LAN only).
+## chore: local dev environment — pm2 workflow
+- Purpose: document the canonical pm2 dev mode (hot-reload via Next Fast Refresh, restart-on-crash; pm2 `watch` stays off) for this machine's dev checkout.
+- Files: `AGENTS.md`.
+- Upstream: not upstream (upstream documents plain `npm run dev`).
+- Disable: revert; this is docs-only since the 2026-09-24 cleanup removed the `.dev-origins.json` override mechanism from `next.config.ts`/`.gitignore`.
 
 ## ~~feat: scope visible models to enabledModels~~ — SUPERSEDED by upstream (v0.8.6)
 - What it did: filter the model list to the user's `enabledModels` in `GET /api/models` and resolve the new-session default within the scoped set so the SDK's `findInitialModel` didn't fall through to `openrouter/moonshotai/kimi-k2.6`; also removed the `enabledProviders` provider whitelist that blocked providers like `opencode-go`.
@@ -43,9 +43,3 @@ Prior-merge history: upstream v0.8.10 expanded its own `allowedDevOrigins` to lo
 - Files: `components/MessageView.tsx`.
 - Upstream: not upstream. Known divergence after the v0.9.3 merge (unchanged since v0.9.1+): `TodoToolBlock` short-circuits `ToolCallBlock`, so it keeps local `useState` expansion and does not use upstream's persisted expansion store (`lib/tool-call-expansion.ts`, which `ToolCallBlock` now reads through `isToolCallExpanded`/`setToolCallExpanded`). A todo card therefore always starts expanded and forgets its open/closed state across reloads. Harmless today; wire `TodoToolBlock` through the same store if that becomes annoying.
 - Disable: revert; non-todo tools are unaffected (the Todo block only matches `toolName === "todo"`).
-
-## feat: spotify-mcp sidecar service (ADR-0016)
-- Purpose: a self-hosted Spotify MCP sidecar that ships with this fork: container build, config delivery script, and the encrypted secrets blob. It runs beside Pi Web and does not change any Pi Web code path.
-- Files: `spotify-mcp/**`, `docs/adr/0016-spotify-mcp-service.md`.
-- Upstream: not upstream, and never will be (local infrastructure).
-- Disable: delete the `spotify-mcp/` directory; nothing in `app/`, `lib/`, or `components/` imports it.
